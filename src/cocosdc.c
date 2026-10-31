@@ -42,8 +42,13 @@
  * last value written to $FF42, which is how software detects the SDC.  Flash
  * programming is not emulated: writes to the flash are ignored.
  *
- * Commands complete immediately: the BUSY delays of the real hardware are not
- * modelled.
+ * Commands take time, as on the real controller: BUSY stays set until a
+ * command completes, and READY is only set once a block can be transferred.
+ * The delays were measured on real hardware.  The MCU reads and writes the SD
+ * card through a single 512 byte buffer, so a logical sector in the same SD
+ * block as the last one is quick, and a modified block is written back when
+ * another is needed.  How long the card itself takes varies a lot from card
+ * to card; the times used here are typical.
  */
 
 #include "top-config.h"
@@ -61,6 +66,7 @@
 
 #include "array.h"
 #include "delegate.h"
+#include "events.h"
 #include "sds.h"
 #include "xalloc.h"
 
@@ -93,6 +99,26 @@
 #define SDC_VERSION (0x0130)
 
 #define SDC_SECTORS_PER_TRACK (18)
+
+// Command timing, measured on a real CoCo SDC.  These are set by the MCU and
+// were the same with every card tried.
+#define T_ACCEPT  EVENT_US(60)    // until a command or block is accepted
+#define T_EXT     EVENT_US(220)   // extended command not using the card
+#define T_INFO    EVENT_US(260)   // 'I' and 'C'
+#define T_LIST    EVENT_US(140)   // "L:" (the directory is read by '>')
+#define T_HIT     EVENT_US(100)   // read a sector in the buffered SD block
+#define T_WRITE   EVENT_US(300)   // write a sector into the buffered block
+#define T_STREAM1 EVENT_US(420)   // first block of a stream
+#define T_STREAM  EVENT_US(220)   // each later block, once the last is read
+#define T_ABORT   EVENT_US(1720)  // abort a stream
+
+// These depend on the SD card: typical values.
+#define T_SD_READ  EVENT_US(1300)  // read a 512 byte block
+#define T_SD_WRITE EVENT_US(3000)  // write a 512 byte block
+#define T_DIR      (4 * T_SD_READ)  // find a file
+#define T_DIRPAGE  (3 * T_SD_READ)  // a page of directory listing
+
+#define SD_BLOCK_NONE (~0U)
 
 struct sdc_dirent {
 	char name[8];
@@ -130,6 +156,14 @@ struct cocosdc {
 	bool byte_mode;  // block transferred 8 bits at a time through $FF4B
 	uint8_t flags;  // MCU option byte, set by the undocumented 'g' command
 
+	// Timing
+	struct event ready_event;  // ends the current command's delay
+	uint8_t ready_status;  // status once the delay is over
+	unsigned ready_count;  // and bytes to transfer
+	event_ticks delay;  // accumulated by the current command
+	unsigned sd_block;  // block in the MCU's buffer: drive << 24 | block
+	bool sd_dirty;  // buffered block has been modified
+
 	// SD card
 	int msgr_client_id;
 	char *sd_root;
@@ -138,6 +172,7 @@ struct cocosdc {
 		sds path;  // host path of a file mounted as raw blocks
 		FILE *raw;  // open if mounted as raw blocks ("m:" or "n:")
 		bool raw_ro;
+		bool written;  // directory entry to update on unmount
 	} drv[2];
 
 	// Streaming ($90/$91): 512 byte blocks of a mounted file
@@ -161,6 +196,11 @@ static const struct ser_struct ser_struct_cocosdc[] = {
 	SER_ID_STRUCT_ELEM(9, struct cocosdc, cmd_mode),
 	SER_ID_STRUCT_ELEM(10, struct cocosdc, status),
 	SER_ID_STRUCT_ELEM(11, struct cocosdc, flags),
+	SER_ID_STRUCT_TYPE(12, ser_type_event, struct cocosdc, ready_event),
+	SER_ID_STRUCT_ELEM(13, struct cocosdc, ready_status),
+	SER_ID_STRUCT_ELEM(14, struct cocosdc, ready_count),
+	SER_ID_STRUCT_ELEM(15, struct cocosdc, sd_block),
+	SER_ID_STRUCT_ELEM(16, struct cocosdc, sd_dirty),
 };
 
 static const struct ser_struct_data cocosdc_ser_struct_data = {
@@ -187,6 +227,7 @@ static void cmd_write(struct cocosdc *d, unsigned reg, uint8_t D);
 static uint8_t cmd_read(struct cocosdc *d, unsigned reg);
 static void stop_stream(struct cocosdc *d);
 static void load_startup_cfg(struct cocosdc *d);
+static void ready_done(void *sptr);
 
 static void cocosdc_ui_set_hd_filename(void *sptr, int tag, void *smsg);
 
@@ -227,6 +268,9 @@ static struct part *cocosdc_allocate(void) {
 	c->reset = cocosdc_reset;
 	c->has_interface = cocosdc_has_interface;
 	c->attach_interface = cocosdc_attach_interface;
+
+	event_init(&d->ready_event, MACHINE_EVENT_LIST, DELEGATE_AS0(void, ready_done, d));
+	d->sd_block = SD_BLOCK_NONE;
 
 	return p;
 }
@@ -272,6 +316,10 @@ static bool cocosdc_finish(struct part *p) {
 		return 0;
 	}
 
+	if (d->ready_event.next == &d->ready_event) {
+		event_queue(&d->ready_event);
+	}
+
 	d->cur_dir = sdsempty();
 	d->msgr_client_id = messenger_client_register();
 	ui_messenger_join_group(d->msgr_client_id, ui_tag_hd_filename, MESSENGER_NOTIFY_DELEGATE(cocosdc_ui_set_hd_filename, d));
@@ -281,6 +329,7 @@ static bool cocosdc_finish(struct part *p) {
 
 static void cocosdc_free(struct part *p) {
 	struct cocosdc *d = (struct cocosdc *)p;
+	event_dequeue(&d->ready_event);
 	messenger_client_unregister(d->msgr_client_id);
 	free(d->sd_root);
 	sdsfree(d->cur_dir);
@@ -331,11 +380,14 @@ static void cocosdc_reset(struct cart *c, bool hard) {
 	d->cmd_mode = 0;
 	d->status = 0;
 	d->buf_count = 0;
+	event_dequeue(&d->ready_event);
 	stop_stream(d);
 	if (hard) {
 		d->bank = 0;
 		d->flash_data = 0;
 		d->flags = 0;
+		d->sd_block = SD_BLOCK_NONE;
+		d->sd_dirty = 0;
 		if (d->sd_root)
 			load_startup_cfg(d);
 	}
@@ -402,6 +454,7 @@ static uint8_t cocosdc_write(struct cart *c, uint16_t A, bool P2, bool R2, uint8
 				LOG_MOD_DEBUG(3, "cocosdc", "FDC emulation mode\n");
 			d->cmd_mode = 0;
 			d->buf_count = 0;
+			event_dequeue(&d->ready_event);
 			stop_stream(d);
 			latch_write(d, D);
 		}
@@ -739,6 +792,55 @@ static uint8_t listing_page(struct cocosdc *d, uint8_t *page) {
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+// Command mode: timing
+
+// Write back the buffered block if it has been modified.
+
+static void sd_flush(struct cocosdc *d) {
+	if (d->sd_dirty) {
+		d->delay += T_SD_WRITE;
+		d->sd_dirty = 0;
+	}
+}
+
+// Bring the SD block holding a logical sector into the buffer.  A sector
+// write needs the whole block too, so it's read first.
+
+static void sd_access(struct cocosdc *d, unsigned drive, unsigned lsn, bool write) {
+	unsigned block = (drive << 24) | (lsn >> 1);
+	if (block != d->sd_block) {
+		sd_flush(d);
+		d->delay += T_SD_READ;
+		d->sd_block = block;
+	}
+	if (write) {
+		d->sd_dirty = 1;
+		d->drv[drive].written = 1;
+	}
+}
+
+// Commands are performed straight away, but the result (status and any block
+// to transfer) is hidden until the accumulated delay is over.  BUSY is set
+// until then.
+
+static void defer(struct cocosdc *d) {
+	if (d->delay < T_ACCEPT)
+		d->delay = T_ACCEPT;
+	d->ready_status = d->status;
+	d->ready_count = d->buf_count;
+	d->buf_count = 0;
+	d->status = STA_BUSY;
+	event_queue_dt(&d->ready_event, d->delay);
+}
+
+static void ready_done(void *sptr) {
+	struct cocosdc *d = sptr;
+	d->status = d->ready_status;
+	d->buf_count = d->ready_count;
+}
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
 // Command mode: mounted images
 
 static struct vdisk *drive_disk(struct cocosdc *d, unsigned drive) {
@@ -832,6 +934,15 @@ static const char *drive_path(struct cocosdc *d, unsigned drive) {
 }
 
 static void unmount(struct cocosdc *d, unsigned drive) {
+	if ((d->sd_block >> 24) == drive) {
+		sd_flush(d);
+		d->sd_block = SD_BLOCK_NONE;
+	}
+	if (d->drv[drive].written) {
+		// Update the file's directory entry
+		d->delay += T_SD_READ + T_SD_WRITE;
+		d->drv[drive].written = 0;
+	}
 	if (d->drv[drive].raw) {
 		fclose(d->drv[drive].raw);
 		d->drv[drive].raw = NULL;
@@ -852,6 +963,7 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 		unmount(d, drive);
 		return 0;
 	}
+	d->delay += T_DIR;
 	sds host = resolve_path(d, path, !create, NULL);
 	if (!host)
 		return STA_FAILED | STA_NOTFOUND;
@@ -866,11 +978,15 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 			sdsfree(host);
 			return STA_FAILED | STA_INVALID;
 		}
+		// The new directory entry, then every block of a disk image:
+		// that takes the real controller most of a second
+		d->delay += T_SD_WRITE;
 		if (!raw) {
 			uint8_t blank[256];
 			memset(blank, 0xff, sizeof(blank));
 			for (unsigned i = 0; i < 35 * SDC_SECTORS_PER_TRACK; i++)
 				fwrite(blank, 1, sizeof(blank), f);
+			d->delay += (35 * SDC_SECTORS_PER_TRACK / 2) * T_SD_WRITE;
 		}
 		fclose(f);
 	} else if (S_ISDIR(st.st_mode)) {
@@ -883,6 +999,9 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 		return STA_FAILED | STA_INUSE;
 	}
 	unmount(d, drive);
+	// Mounting leaves the file's first block in the MCU's buffer
+	sd_flush(d);
+	d->sd_block = drive << 24;
 	if (raw) {
 		bool ro = 0;
 		FILE *f = fopen(host, "r+b");
@@ -943,6 +1062,7 @@ static void load_startup_cfg(struct cocosdc *d) {
 }
 
 static uint8_t set_dir(struct cocosdc *d, const char *path) {
+	d->delay += T_DIR;
 	sds rel = NULL;
 	sds host = resolve_path(d, *path ? path : "/", 1, &rel);
 	if (!host)
@@ -965,6 +1085,7 @@ static uint8_t set_dir(struct cocosdc *d, const char *path) {
 // renamed.
 
 static uint8_t rename_file(struct cocosdc *d, const char *from, const char *to) {
+	d->delay += 2 * T_DIR + T_SD_WRITE;
 	sds old = resolve_path(d, from, 1, NULL);
 	sds new = resolve_path(d, to, 0, NULL);
 	char name[8], ext[3];
@@ -1011,8 +1132,10 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 	case 'D':
 		return set_dir(d, arg);
 	case 'L':
+		d->delay += T_LIST;
 		return start_listing(d, arg);
 	case 'K': {
+		d->delay += T_DIR + 2 * T_SD_WRITE;
 		sds host = resolve_path(d, arg, 0, NULL);
 		uint8_t r = (host && mkdir(host, 0777) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
 		sdsfree(host);
@@ -1026,6 +1149,7 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 		return rename_file(d, arg, to);
 	}
 	case 'X': {
+		d->delay += T_DIR + T_SD_WRITE;
 		sds host = resolve_path(d, arg, 1, NULL);
 		uint8_t r = (host && remove(host) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
 		sdsfree(host);
@@ -1055,6 +1179,7 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 	switch (d->param[0]) {
 	case 'I': {
 		// Info for mounted image
+		d->delay = T_INFO;
 		const char *path = drive_path(d, drive);
 		if (!path) {
 			d->status = STA_FAILED | STA_NOTFOUND;
@@ -1067,6 +1192,7 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 	}
 	case 'Q': {
 		// Size of mounted image in sectors: the file size / 256
+		d->delay = T_SD_READ;
 		const char *path = drive_path(d, drive);
 		struct stat st;
 		if (!path || stat(path, &st) != 0) {
@@ -1082,6 +1208,7 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 	}
 	case 'C': {
 		// Current directory leaf
+		d->delay = T_INFO;
 		memset(d->buf, 0, 256);
 		if (sdslen(d->cur_dir) == 0) {
 			send_block(d, 0);
@@ -1095,6 +1222,7 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 		return;
 	}
 	case '>':
+		d->delay = T_DIRPAGE;
 		if (!d->listing) {
 			d->status = STA_FAILED;
 			return;
@@ -1106,6 +1234,7 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 		// byte 3 flags the drives (bit per drive select line) it should
 		// access through FDC emulation instead of logical sectors.
 		// Every image works by logical sector here, so none are flagged.
+		d->delay = T_EXT;
 		d->param[2] = 0;
 		d->status = 0;
 		return;
@@ -1114,10 +1243,12 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 		// byte 2) OR byte 3.  SDC-DOS clears bit 0 for RUN @n and sets
 		// it for RUN @n,R before switching bank.  The firmware tests bit
 		// 7 in its FDC emulation; nothing here depends on either bit.
+		d->delay = T_EXT;
 		d->flags = (d->flags & d->param[1]) | d->param[2];
 		d->status = 0;
 		return;
 	case 'V':
+		d->delay = T_EXT;
 		d->param[1] = SDC_VERSION >> 8;
 		d->param[2] = SDC_VERSION & 0xff;
 		d->status = 0;
@@ -1134,9 +1265,13 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 static void block_received(struct cocosdc *d) {
 	unsigned drive = d->cmd & 1;
 	unsigned lsn = (d->param[0] << 16) | (d->param[1] << 8) | d->param[2];
+	d->delay = 0;
 	switch (d->cmd & 0xf0) {
 	case 0xa0:
+		d->delay = T_WRITE;
 		d->status = write_lsn(d, drive, lsn, d->cmd & 2);
+		if (!d->status)
+			sd_access(d, drive, lsn, 1);
 		break;
 	case 0xe0:
 		d->status = sd_command(d, drive);
@@ -1145,12 +1280,13 @@ static void block_received(struct cocosdc *d) {
 		d->status = 0;
 		break;
 	}
+	defer(d);
 }
 
 // Streaming: the mounted file is read continuously in 512 byte blocks (the SD
 // card's native size), starting at the block given in the parameters.  BUSY
 // stays set while the stream lasts and READY marks each block; a short last
-// block is padded with zeroes.  The next block is ready as soon as the last
+// block is padded with zeroes.  The next block is ready shortly after the last
 // byte of a block is read.  The stream ends at the end of the file (BUSY
 // clears), on command $D0, or when command mode is left.
 
@@ -1185,20 +1321,30 @@ static void start_stream(struct cocosdc *d, unsigned drive, unsigned block, bool
 	}
 	d->stream = f;
 	d->byte_mode = byte_mode;
+	// Streaming uses the MCU's buffer
+	sd_flush(d);
+	d->sd_block = SD_BLOCK_NONE;
+	d->delay += T_STREAM1;
 	next_stream_block(d);
 }
 
 static void command(struct cocosdc *d, uint8_t cmd) {
 	unsigned drive = cmd & 1;
 	unsigned lsn = (d->param[0] << 16) | (d->param[1] << 8) | d->param[2];
+	bool streaming = d->stream != NULL;
 	d->cmd = cmd;
 	d->buf_count = 0;
+	d->delay = 0;
+	event_dequeue(&d->ready_event);
 	stop_stream(d);
 	LOG_MOD_DEBUG(3, "cocosdc", "command $%02x params $%02x $%02x $%02x\n", cmd, d->param[0], d->param[1], d->param[2]);
 	switch (cmd & 0xf0) {
 	case 0x80:
 		d->byte_mode = cmd & 4;
+		d->delay = T_HIT;
 		send_block(d, read_lsn(d, drive, lsn, cmd & 2));
+		if (!(d->status & STA_FAILED))
+			sd_access(d, drive, lsn, 0);
 		break;
 	case 0xa0:
 	case 0xe0:
@@ -1207,6 +1353,7 @@ static void command(struct cocosdc *d, uint8_t cmd) {
 		d->buf_count = 256;
 		d->buf_rx = 1;
 		d->status = STA_BUSY | STA_READY;
+		d->delay = T_ACCEPT;
 		break;
 	case 0xc0:
 		d->byte_mode = 0;
@@ -1216,14 +1363,16 @@ static void command(struct cocosdc *d, uint8_t cmd) {
 		start_stream(d, drive, lsn, cmd & 4);
 		break;
 	case 0xd0:
-		stop_stream(d);
-		d->status = 0;
+		// After aborting a stream, the real controller reports $08
+		d->status = streaming ? STA_CRC : 0;
+		d->delay = streaming ? T_ABORT : 0;
 		break;
 	default:
 		LOG_MOD_DEBUG(1, "cocosdc", "unsupported command $%02x\n", cmd);
 		d->status = STA_FAILED;
 		break;
 	}
+	defer(d);
 }
 
 static void cmd_write(struct cocosdc *d, unsigned reg, uint8_t D) {
@@ -1243,10 +1392,13 @@ static void cmd_write(struct cocosdc *d, unsigned reg, uint8_t D) {
 static uint8_t cmd_read(struct cocosdc *d, unsigned reg) {
 	if (reg == 0)
 		return d->status;
-	if (d->stream && (reg == 3 || (reg == 2 && !d->byte_mode))) {
+	if (d->stream && (d->status & STA_READY) && (reg == 3 || (reg == 2 && !d->byte_mode))) {
 		uint8_t v = d->sbuf[d->spos++];
-		if (d->spos == sizeof(d->sbuf))
+		if (d->spos == sizeof(d->sbuf)) {
+			d->delay = T_STREAM;
 			next_stream_block(d);
+			defer(d);
+		}
 		return v;
 	}
 	if (d->buf_count && !d->buf_rx && (reg == 3 || (reg == 2 && !d->byte_mode))) {
