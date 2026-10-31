@@ -29,7 +29,9 @@
  * SDC drives 0 and 1 are XRoar's floppy drives 0 and 1, so -load-fd0 and
  * -load-fd1 mount images in them.  The SD card is a host directory given
  * with -load-hd0; commands that mount images or list directories work
- * within it.
+ * within it, and its STARTUP.CFG mounts images at power up.  A file can
+ * also be mounted as an array of raw 256 byte blocks ("m:"), accessible by
+ * logical sector number or streaming but not through FDC emulation.
  *
  * The 128K of flash is eight 16K banks mapped at $C000-$FEFF.  By default
  * bank 0 holds SDC-DOS, bank 1 RS-DOS, bank 4 "dplus-sdc" and bank 5 a
@@ -130,6 +132,16 @@ struct cocosdc {
 	int msgr_client_id;
 	char *sd_root;
 	sds cur_dir;  // relative to sd_root, no leading or trailing '/'
+	struct {
+		sds path;  // host path of a file mounted as raw blocks
+		FILE *raw;  // open if mounted as raw blocks ("m:" or "n:")
+		bool raw_ro;
+	} drv[2];
+
+	// Streaming ($90/$91): 512 byte blocks of a mounted file
+	FILE *stream;
+	uint8_t sbuf[512];
+	unsigned spos;
 	struct sdc_dirent *listing;
 	unsigned listing_n;
 	unsigned listing_pos;
@@ -170,6 +182,8 @@ static void latch_write(struct cocosdc *d, unsigned D);
 
 static void cmd_write(struct cocosdc *d, unsigned reg, uint8_t D);
 static uint8_t cmd_read(struct cocosdc *d, unsigned reg);
+static void stop_stream(struct cocosdc *d);
+static void load_startup_cfg(struct cocosdc *d);
 
 static void cocosdc_ui_set_hd_filename(void *sptr, int tag, void *smsg);
 
@@ -267,6 +281,13 @@ static void cocosdc_free(struct part *p) {
 	messenger_client_unregister(d->msgr_client_id);
 	free(d->sd_root);
 	sdsfree(d->cur_dir);
+	for (unsigned i = 0; i < 2; i++) {
+		sdsfree(d->drv[i].path);
+		if (d->drv[i].raw)
+			fclose(d->drv[i].raw);
+	}
+	if (d->stream)
+		fclose(d->stream);
 	free(d->listing);
 	cart_rom_free(p);
 }
@@ -290,6 +311,7 @@ static void cocosdc_ui_set_hd_filename(void *sptr, int tag, void *smsg) {
 		struct stat st;
 		if (stat(uimsg->data, &st) == 0 && S_ISDIR(st.st_mode)) {
 			d->sd_root = xstrdup(uimsg->data);
+			load_startup_cfg(d);
 		} else {
 			LOG_MOD_WARN("cocosdc", "SD card must be a directory: %s\n", (const char *)uimsg->data);
 		}
@@ -306,9 +328,12 @@ static void cocosdc_reset(struct cart *c, bool hard) {
 	d->cmd_mode = 0;
 	d->status = 0;
 	d->buf_count = 0;
+	stop_stream(d);
 	if (hard) {
 		d->bank = 0;
 		d->flash_data = 0;
+		if (d->sd_root)
+			load_startup_cfg(d);
 	}
 	latch_write(d, 0);
 }
@@ -373,6 +398,7 @@ static uint8_t cocosdc_write(struct cart *c, uint16_t A, bool P2, bool R2, uint8
 				LOG_MOD_DEBUG(3, "cocosdc", "FDC emulation mode\n");
 			d->cmd_mode = 0;
 			d->buf_count = 0;
+			stop_stream(d);
 			latch_write(d, D);
 		}
 		break;
@@ -734,7 +760,31 @@ static bool lsn_chs(struct vdisk *disk, unsigned lsn, bool ss, unsigned *cyl, un
 	return *cyl < disk->num_cylinders;
 }
 
+// Read or write a 256 byte block of a file mounted as raw blocks.  The last
+// block of a file that isn't a multiple of 256 bytes is padded with zeroes.
+
+static uint8_t raw_read(struct cocosdc *d, unsigned drive, unsigned lsn) {
+	FILE *f = d->drv[drive].raw;
+	memset(d->buf, 0, 256);
+	if (fseeko(f, (off_t)lsn * 256, SEEK_SET) != 0)
+		return STA_FAILED | STA_NOTFOUND;
+	size_t n = fread(d->buf, 1, 256, f);
+	return n > 0 ? 0 : (STA_FAILED | STA_NOTFOUND);
+}
+
+static uint8_t raw_write(struct cocosdc *d, unsigned drive, unsigned lsn) {
+	FILE *f = d->drv[drive].raw;
+	if (d->drv[drive].raw_ro)
+		return STA_FAILED | STA_INUSE;
+	if (fseeko(f, (off_t)lsn * 256, SEEK_SET) != 0 || fwrite(d->buf, 1, 256, f) != 256)
+		return STA_FAILED | STA_NOTFOUND;
+	fflush(f);
+	return 0;
+}
+
 static uint8_t read_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool ss) {
+	if (d->drv[drive].raw)
+		return raw_read(d, drive, lsn);
 	struct vdisk *disk = drive_disk(d, drive);
 	if (!disk)
 		return STA_FAILED | STA_NOTFOUND;
@@ -750,6 +800,8 @@ static uint8_t read_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool ss
 }
 
 static uint8_t write_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool ss) {
+	if (d->drv[drive].raw)
+		return raw_write(d, drive, lsn);
 	struct vdisk *disk = drive_disk(d, drive);
 	if (!disk)
 		return STA_FAILED | STA_NOTFOUND;
@@ -764,31 +816,60 @@ static uint8_t write_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool s
 	return ok ? 0 : (STA_FAILED | STA_NOTFOUND);
 }
 
-// Host path of the image in a drive.  Images may also have been inserted some
-// other way (-load-fd0, the UI), so the path comes from the drive.
+// Host path of the file in a drive.  Disk images may also have been
+// inserted some other way (-load-fd0, the UI), so their path comes from the
+// drive.
 
 static const char *drive_path(struct cocosdc *d, unsigned drive) {
+	if (d->drv[drive].raw)
+		return d->drv[drive].path;
 	struct vdisk *disk = drive_disk(d, drive);
 	return disk ? disk->filename : NULL;
 }
 
 static void unmount(struct cocosdc *d, unsigned drive) {
+	if (d->drv[drive].raw) {
+		fclose(d->drv[drive].raw);
+		d->drv[drive].raw = NULL;
+	}
+	sdsfree(d->drv[drive].path);
+	d->drv[drive].path = NULL;
 	if (drive_disk(d, drive))
 		xroar_eject_disk(drive);
 }
 
-// Mount a disk image through the floppy drives.
+// Mount a file: as a disk image through the floppy drives, or as raw blocks
+// (raw files can't be accessed through FDC emulation).  If create is set,
+// the file is created first if it doesn't exist; a new disk image is a blank
+// 35 track single sided DSK (630 sectors).
 
-static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path) {
+static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, bool raw, bool create) {
 	if (!*path) {
 		unmount(d, drive);
 		return 0;
 	}
-	sds host = resolve_path(d, path, 1, NULL);
+	sds host = resolve_path(d, path, !create, NULL);
 	if (!host)
 		return STA_FAILED | STA_NOTFOUND;
 	struct stat st;
-	if (stat(host, &st) != 0 || S_ISDIR(st.st_mode)) {
+	if (stat(host, &st) != 0) {
+		if (!create) {
+			sdsfree(host);
+			return STA_FAILED | STA_NOTFOUND;
+		}
+		FILE *f = fopen(host, "wb");
+		if (!f) {
+			sdsfree(host);
+			return STA_FAILED | STA_INVALID;
+		}
+		if (!raw) {
+			uint8_t blank[256];
+			memset(blank, 0xff, sizeof(blank));
+			for (unsigned i = 0; i < 35 * SDC_SECTORS_PER_TRACK; i++)
+				fwrite(blank, 1, sizeof(blank), f);
+		}
+		fclose(f);
+	} else if (S_ISDIR(st.st_mode)) {
 		sdsfree(host);
 		return STA_FAILED | STA_NOTFOUND;
 	}
@@ -798,9 +879,63 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path) {
 		return STA_FAILED | STA_INUSE;
 	}
 	unmount(d, drive);
+	if (raw) {
+		bool ro = 0;
+		FILE *f = fopen(host, "r+b");
+		if (!f) {
+			f = fopen(host, "rb");
+			ro = 1;
+		}
+		if (!f) {
+			sdsfree(host);
+			return STA_FAILED | STA_NOTFOUND;
+		}
+		d->drv[drive].raw = f;
+		d->drv[drive].raw_ro = ro;
+		d->drv[drive].path = host;
+		return 0;
+	}
 	xroar_insert_disk_file(drive, host);
 	sdsfree(host);
 	return drive_disk(d, drive) ? 0 : (STA_FAILED | STA_INVALID);
+}
+
+// STARTUP.CFG in the SD card's root directory lists images for the
+// controller to mount at power up: "0=path" and "1=path" for the drives and
+// "D=path" for the current directory.  Drives that already hold an image
+// (given on the command line, say) are left alone.
+
+static uint8_t set_dir(struct cocosdc *d, const char *path);
+
+static void load_startup_cfg(struct cocosdc *d) {
+	sds host = resolve_path(d, "/STARTUP.CFG", 1, NULL);
+	if (!host)
+		return;
+	FILE *f = fopen(host, "rb");
+	sdsfree(host);
+	if (!f)
+		return;
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = 0;
+		if (line[0] == 0 || line[1] != '=')
+			continue;
+		const char *arg = line + 2;
+		switch (toupper((unsigned char)line[0])) {
+		case '0': case '1': {
+			unsigned drive = line[0] - '0';
+			if (!drive_path(d, drive) && mount_file(d, drive, arg, 0, 0) == 0)
+				LOG_MOD_DEBUG(1, "cocosdc", "STARTUP.CFG: drive %u = %s\n", drive, arg);
+			break;
+		}
+		case 'D':
+			set_dir(d, arg);
+			break;
+		default:
+			break;
+		}
+	}
+	fclose(f);
 }
 
 static uint8_t set_dir(struct cocosdc *d, const char *path) {
@@ -828,8 +963,14 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 	if (d->buf[1] != ':')
 		return STA_FAILED | STA_INVALID;
 	switch (d->buf[0]) {
-	case 'M':
-		return mount_file(d, drive, arg);
+	case 'M': case 'm':
+		return mount_file(d, drive, arg, d->buf[0] == 'm', 0);
+	case 'N': case 'n':
+		// Creating SDF images (cylinders and sides in the parameters)
+		// isn't supported
+		if (d->buf[0] == 'N' && (d->param[0] || d->param[1]))
+			return STA_FAILED | STA_INVALID;
+		return mount_file(d, drive, arg, d->buf[0] == 'n', 1);
 	case 'D':
 		return set_dir(d, arg);
 	case 'L':
@@ -946,11 +1087,53 @@ static void block_received(struct cocosdc *d) {
 	}
 }
 
+// Streaming: the mounted file is read continuously in 512 byte blocks (the SD
+// card's native size), starting at the block given in the parameters.  BUSY
+// stays set while the stream lasts and READY marks each block; a short last
+// block is padded with zeroes.  The next block is ready as soon as the last
+// byte of a block is read.  The stream ends at the end of the file (BUSY
+// clears), on command $D0, or when command mode is left.
+
+static void stop_stream(struct cocosdc *d) {
+	if (d->stream) {
+		fclose(d->stream);
+		d->stream = NULL;
+	}
+}
+
+static bool next_stream_block(struct cocosdc *d) {
+	memset(d->sbuf, 0, sizeof(d->sbuf));
+	if (fread(d->sbuf, 1, sizeof(d->sbuf), d->stream) == 0) {
+		stop_stream(d);
+		d->status = 0;
+		return 0;
+	}
+	d->spos = 0;
+	d->status = STA_BUSY | STA_READY;
+	return 1;
+}
+
+static void start_stream(struct cocosdc *d, unsigned drive, unsigned block, bool byte_mode) {
+	stop_stream(d);
+	const char *path = drive_path(d, drive);
+	FILE *f = path ? fopen(path, "rb") : NULL;
+	if (!f || fseeko(f, (off_t)block * 512, SEEK_SET) != 0) {
+		if (f)
+			fclose(f);
+		d->status = STA_FAILED;
+		return;
+	}
+	d->stream = f;
+	d->byte_mode = byte_mode;
+	next_stream_block(d);
+}
+
 static void command(struct cocosdc *d, uint8_t cmd) {
 	unsigned drive = cmd & 1;
 	unsigned lsn = (d->param[0] << 16) | (d->param[1] << 8) | d->param[2];
 	d->cmd = cmd;
 	d->buf_count = 0;
+	stop_stream(d);
 	LOG_MOD_DEBUG(3, "cocosdc", "command $%02x params $%02x $%02x $%02x\n", cmd, d->param[0], d->param[1], d->param[2]);
 	switch (cmd & 0xf0) {
 	case 0x80:
@@ -968,6 +1151,13 @@ static void command(struct cocosdc *d, uint8_t cmd) {
 	case 0xc0:
 		d->byte_mode = 0;
 		ext_command(d, drive);
+		break;
+	case 0x90:
+		start_stream(d, drive, lsn, cmd & 4);
+		break;
+	case 0xd0:
+		stop_stream(d);
+		d->status = 0;
 		break;
 	default:
 		LOG_MOD_DEBUG(1, "cocosdc", "unsupported command $%02x\n", cmd);
@@ -993,6 +1183,12 @@ static void cmd_write(struct cocosdc *d, unsigned reg, uint8_t D) {
 static uint8_t cmd_read(struct cocosdc *d, unsigned reg) {
 	if (reg == 0)
 		return d->status;
+	if (d->stream && (reg == 3 || (reg == 2 && !d->byte_mode))) {
+		uint8_t v = d->sbuf[d->spos++];
+		if (d->spos == sizeof(d->sbuf))
+			next_stream_block(d);
+		return v;
+	}
 	if (d->buf_count && !d->buf_rx && (reg == 3 || (reg == 2 && !d->byte_mode))) {
 		uint8_t v = d->buf[d->buf_pos++];
 		if (--d->buf_count == 0 && !(d->status & STA_FAILED))
