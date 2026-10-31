@@ -14,46 +14,138 @@
 
 /* Sources
  *
- * - CoCo SDC User Guide
+ * - CoCo SDC User Guide (Darren Atkinson)
  * - CoCo SDC Technical Info
+ * - VCC's CoCo SDC emulation (sdc.cpp)
+ */
+
+/* The CoCo SDC is a floppy controller replacement.  In "FDC emulation" mode
+ * it looks like a WD1793 based disk controller, emulated here with the same
+ * WD2793 and virtual drives as the RS-DOS cartridge.  Storing $43 in the
+ * control latch ($FF40) switches it to "command mode", where $FF48-$FF4B
+ * become a command interface for reading and writing logical sectors of the
+ * mounted images and for operations on the SD card's files.
+ *
+ * SDC drives 0 and 1 are XRoar's floppy drives 0 and 1, so -load-fd0 and
+ * -load-fd1 mount images in them.  The SD card is a host directory given
+ * with -load-hd0; commands that mount images or list directories work
+ * within it.
+ *
+ * The 128K of flash is eight 16K banks mapped at $C000-$FEFF.  By default
+ * bank 0 holds SDC-DOS, bank 1 RS-DOS, bank 4 "dplus-sdc" and bank 5 a
+ * DragonDOS compatible DOS.  A ROM image given with -cart-rom fills banks from
+ * 0 instead.  Writing $FF43 selects the bank (low three bits).  Reading $FF43
+ * returns the bank number in the low three bits and the top five bits of the
+ * last value written to $FF42, which is how software detects the SDC.  Flash
+ * programming is not emulated: writes to the flash are ignored.
+ *
+ * Commands complete immediately: the BUSY delays of the real hardware are not
+ * modelled.
  */
 
 #include "top-config.h"
 
 #include <assert.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "array.h"
 #include "delegate.h"
 #include "sds.h"
+#include "xalloc.h"
 
 #include "cart.h"
 #include "logging.h"
+#include "messenger.h"
 #include "part.h"
-//#include "rom.h"
 #include "rombank.h"
 #include "romlist.h"
 #include "serialise.h"
+#include "ui.h"
+#include "vdisk.h"
+#include "vdrive.h"
+#include "wd279x.h"
+#include "xroar.h"
+
+#define SDC_BANK_SIZE (0x4000)
+#define SDC_NBANKS (8)
+
+// Status register bits
+#define STA_BUSY     (0x01)
+#define STA_READY    (0x02)
+#define STA_INVALID  (0x04)
+#define STA_CRC      (0x08)
+#define STA_NOTFOUND (0x10)
+#define STA_INUSE    (0x20)
+#define STA_FAILED   (0x80)
+
+// Firmware version reported by the 'V' command (BCD)
+#define SDC_VERSION (0x0130)
+
+#define SDC_SECTORS_PER_TRACK (18)
+
+struct sdc_dirent {
+	char name[8];
+	char ext[3];
+	uint8_t attr;
+	uint32_t size;
+};
 
 struct cocosdc {
 	struct cart cart;
+
+	// FDC emulation
 	unsigned latch_old;
 	unsigned latch_drive_select;
-	bool latch_motor_enable;
-	bool latch_precomp_enable;
 	bool latch_density;
-	bool latch_nmi_enable;
+	bool drq_flag;
+	bool intrq_flag;
+	bool halt_enable;
+	struct WD279X *fdc;
+	struct vdrive_interface *vdrive_interface;
+
+	// Flash
+	unsigned bank;
+	uint8_t flash_data;
+
+	// Command mode
+	bool cmd_mode;
+	uint8_t cmd;
+	uint8_t status;
+	uint8_t param[3];
+	uint8_t buf[256];
+	unsigned buf_pos;
+	unsigned buf_count;  // bytes left to transfer
+	bool buf_rx;  // block is being sent by the CoCo
+	bool byte_mode;  // block transferred 8 bits at a time through $FF4B
+
+	// SD card
+	int msgr_client_id;
+	char *sd_root;
+	sds cur_dir;  // relative to sd_root, no leading or trailing '/'
+	struct sdc_dirent *listing;
+	unsigned listing_n;
+	unsigned listing_pos;
 };
 
 static const struct ser_struct ser_struct_cocosdc[] = {
 	SER_ID_STRUCT_NEST(1, &cart_ser_struct_data),
 	SER_ID_STRUCT_ELEM(2, struct cocosdc, latch_drive_select),
-	SER_ID_STRUCT_ELEM(3, struct cocosdc, latch_motor_enable),
-	SER_ID_STRUCT_ELEM(4, struct cocosdc, latch_precomp_enable),
-	SER_ID_STRUCT_ELEM(5, struct cocosdc, latch_density),
-	SER_ID_STRUCT_ELEM(6, struct cocosdc, latch_nmi_enable),
+	SER_ID_STRUCT_ELEM(3, struct cocosdc, latch_density),
+	SER_ID_STRUCT_ELEM(4, struct cocosdc, drq_flag),
+	SER_ID_STRUCT_ELEM(5, struct cocosdc, intrq_flag),
+	SER_ID_STRUCT_ELEM(6, struct cocosdc, halt_enable),
+	SER_ID_STRUCT_ELEM(7, struct cocosdc, bank),
+	SER_ID_STRUCT_ELEM(8, struct cocosdc, flash_data),
+	SER_ID_STRUCT_ELEM(9, struct cocosdc, cmd_mode),
+	SER_ID_STRUCT_ELEM(10, struct cocosdc, status),
 };
 
 static const struct ser_struct_data cocosdc_ser_struct_data = {
@@ -65,18 +157,25 @@ static const struct ser_struct_data cocosdc_ser_struct_data = {
 
 static void cocosdc_config_complete(struct cart_config *);
 
-/* Cart interface */
 static uint8_t cocosdc_read(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D);
 static uint8_t cocosdc_write(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D);
 static void cocosdc_reset(struct cart *c, bool hard);
 static void cocosdc_detach(struct cart *c);
+static bool cocosdc_has_interface(struct cart *c, const char *ifname);
+static void cocosdc_attach_interface(struct cart *c, const char *ifname, void *intf);
 
-/* Latch */
-static void latch_write(struct cocosdc *n, unsigned D);
+static void set_drq(void *sptr, bool value);
+static void set_intrq(void *sptr, bool value);
+static void latch_write(struct cocosdc *d, unsigned D);
+
+static void cmd_write(struct cocosdc *d, unsigned reg, uint8_t D);
+static uint8_t cmd_read(struct cocosdc *d, unsigned reg);
+
+static void cocosdc_ui_set_hd_filename(void *sptr, int tag, void *smsg);
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-// CoCoSDC part creation
+// CoCo SDC part creation
 
 static struct part *cocosdc_allocate(void);
 static void cocosdc_initialise(struct part *p, void *options);
@@ -94,14 +193,14 @@ static const struct partdb_entry_funcs cocosdc_funcs = {
 	.is_a = dragon_cart_is_a,
 };
 
-const struct cart_partdb_entry cocosdc_part = { .partdb_entry = { .name = "cocosdc", .description = "Darren Atkinson | CoCoSDC", .funcs = &cocosdc_funcs }, .config_complete = cocosdc_config_complete };
+const struct cart_partdb_entry cocosdc_part = { .partdb_entry = { .name = "cocosdc", .description = "Darren Atkinson | CoCo SDC", .funcs = &cocosdc_funcs }, .config_complete = cocosdc_config_complete };
 
 static struct part *cocosdc_allocate(void) {
-	struct cocosdc *n = part_new(sizeof(*n));
-	struct cart *c = &n->cart;
+	struct cocosdc *d = part_new(sizeof(*d));
+	struct cart *c = &d->cart;
 	struct part *p = &c->part;
 
-	*n = (struct cocosdc){0};
+	*d = (struct cocosdc){0};
 
 	cart_rom_init(c);
 
@@ -109,60 +208,67 @@ static struct part *cocosdc_allocate(void) {
 	c->read = cocosdc_read;
 	c->write = cocosdc_write;
 	c->reset = cocosdc_reset;
+	c->has_interface = cocosdc_has_interface;
+	c->attach_interface = cocosdc_attach_interface;
 
 	return p;
 }
 
 static void cocosdc_initialise(struct part *p, void *options) {
-	struct cart *c = (struct cart *)p;
 	struct cart_config *cc = options;
 	assert(cc != NULL);
 
-	c->config = cc;
+	cart_rom_initialise(p, options);
+	part_add_component(p, part_create("WD2793", "WD2793"), "FDC");
+}
+
+// Load a ROM image into a flash bank, unless the bank already holds one.
+
+static void load_bank(struct rombank *rb, unsigned bank, const char *name) {
+	if (rb->d[bank])
+		return;
+	sds tmp = romlist_find(name);
+	if (tmp)
+		rombank_load_image(rb, bank, tmp, 0);
+	sdsfree(tmp);
 }
 
 static bool cocosdc_finish(struct part *p) {
-	struct cocosdc *n = (struct cocosdc *)p;
-	struct cart *c = &n->cart;
+	struct cocosdc *d = (struct cocosdc *)p;
+	struct cart *c = &d->cart;
 
-	// 8 * 16K ROM image
-	c->ROM = rombank_new(8, 16384, 8);
-
-	{
-		sds tmp = romlist_find("sdcdos");
-		if (tmp) {
-			rombank_load_image(c->ROM, 0, tmp, 0);
-		}
-		sdsfree(tmp);
-
-		tmp = romlist_find("@rsdos");
-		if (tmp) {
-			rombank_load_image(c->ROM, 1, tmp, 0);
-		}
-		sdsfree(tmp);
-
-		tmp = romlist_find("dplus-sdc");
-		if (tmp) {
-			rombank_load_image(c->ROM, 4, tmp, 0);
-		}
-		sdsfree(tmp);
-
-		tmp = romlist_find("@dragondos_compat");
-		if (tmp) {
-			rombank_load_image(c->ROM, 5, tmp, 0);
-		}
-		sdsfree(tmp);
+	d->fdc = (struct WD279X *)part_component_by_id_is_a(p, "FDC", "WD2793");
+	if (d->fdc == NULL) {
+		return 0;
 	}
 
-	rombank_report(c->ROM, "cocosdc", "ROM");
+	// A ROM image given with -cart-rom fills banks from 0, otherwise bank
+	// 0 holds SDC-DOS.  Banks still empty get the default layout.
+	c->ROM = rombank_new(8, SDC_BANK_SIZE, SDC_NBANKS);
+	load_bank(c->ROM, 0, c->config->rom ? c->config->rom : "sdcdos");
+	load_bank(c->ROM, 1, "@rsdos");
+	load_bank(c->ROM, 4, "dplus-sdc");
+	load_bank(c->ROM, 5, "@dragondos_compat");
+	rombank_report(c->ROM, "cocosdc", "Flash");
+
+	if (!cart_finish(p)) {
+		return 0;
+	}
+
+	d->cur_dir = sdsempty();
+	d->msgr_client_id = messenger_client_register();
+	ui_messenger_join_group(d->msgr_client_id, ui_tag_hd_filename, MESSENGER_NOTIFY_DELEGATE(cocosdc_ui_set_hd_filename, d));
 
 	return 1;
 }
 
 static void cocosdc_free(struct part *p) {
-	struct cocosdc *n = (struct cocosdc *)p;
-	struct cart *c = &n->cart;
-	rombank_free(c->ROM);
+	struct cocosdc *d = (struct cocosdc *)p;
+	messenger_client_unregister(d->msgr_client_id);
+	free(d->sd_root);
+	sdsfree(d->cur_dir);
+	free(d->listing);
+	cart_rom_free(p);
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -171,101 +277,729 @@ static void cocosdc_config_complete(struct cart_config *cc) {
 	(void)cc;
 }
 
+static void cocosdc_ui_set_hd_filename(void *sptr, int tag, void *smsg) {
+	struct cocosdc *d = sptr;
+	struct ui_state_message *uimsg = smsg;
+	assert(tag == ui_tag_hd_filename);
+	if (uimsg->value != 0)
+		return;
+	free(d->sd_root);
+	d->sd_root = NULL;
+	sdsclear(d->cur_dir);
+	if (uimsg->data) {
+		struct stat st;
+		if (stat(uimsg->data, &st) == 0 && S_ISDIR(st.st_mode)) {
+			d->sd_root = xstrdup(uimsg->data);
+		} else {
+			LOG_MOD_WARN("cocosdc", "SD card must be a directory: %s\n", (const char *)uimsg->data);
+		}
+	}
+}
+
 static void cocosdc_reset(struct cart *c, bool hard) {
-	struct cocosdc *n = (struct cocosdc *)c;
+	struct cocosdc *d = (struct cocosdc *)c;
 	cart_rom_reset(c, hard);
-	n->latch_old = -1;
-	latch_write(n, 0);
+	wd279x_reset(d->fdc);
+	d->latch_old = -1;
+	d->latch_drive_select = -1;
+	d->drq_flag = d->intrq_flag = 0;
+	d->cmd_mode = 0;
+	d->status = 0;
+	d->buf_count = 0;
+	if (hard) {
+		d->bank = 0;
+		d->flash_data = 0;
+	}
+	latch_write(d, 0);
 }
 
 static void cocosdc_detach(struct cart *c) {
-	/* struct cocosdc *n = (struct cocosdc *)c; */
+	struct cocosdc *d = (struct cocosdc *)c;
+	vdrive_disconnect(d->vdrive_interface);
+	wd279x_disconnect(d->fdc);
 	cart_rom_detach(c);
 }
 
 static uint8_t cocosdc_read(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D) {
-	/* struct cocosdc *n = (struct cocosdc *)c; */
+	struct cocosdc *d = (struct cocosdc *)c;
 	if (R2) {
-		rombank_d8(c->ROM, A, &D);
+		if ((A & 0x3fff) < 0x3f00)
+			rombank_d8(c->ROM, (d->bank << 14) | (A & 0x3fff), &D);
 		return D;
 	}
 	if (!P2) {
 		return D;
 	}
-	if ((A & 0xc) == 0) {
-		// XXX FDC read
+	unsigned reg = A & 0xf;
+	if (reg & 0x8) {
+		if (d->cmd_mode)
+			return cmd_read(d, reg & 3);
+		return wd279x_read(d->fdc, A);
 	}
-	if (!(A & 8))
-		return D;
+	switch (reg) {
+	case 0x2:
+		return d->flash_data;
+	case 0x3:
+		return d->bank | (d->flash_data & 0xf8);
+	default:
+		break;
+	}
 	return D;
 }
 
 static uint8_t cocosdc_write(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D) {
-	struct cocosdc *n = (struct cocosdc *)c;
-	(void)R2;
+	struct cocosdc *d = (struct cocosdc *)c;
 	if (R2) {
-		rombank_d8(c->ROM, A, &D);
 		return D;
 	}
 	if (!P2) {
 		return D;
 	}
-	if ((A & 0xc) == 0) {
-		// XXX FDC write
+	unsigned reg = A & 0xf;
+	if (reg & 0x8) {
+		if (d->cmd_mode)
+			cmd_write(d, reg & 3, D);
+		else
+			wd279x_write(d->fdc, A, D);
 		return D;
 	}
-	if (!(A & 8))
-		return D;
-	latch_write(n, D);
+	switch (reg) {
+	case 0x0:
+		if (D == 0x43) {
+			d->cmd_mode = 1;
+			LOG_MOD_DEBUG(3, "cocosdc", "command mode\n");
+		} else {
+			if (d->cmd_mode)
+				LOG_MOD_DEBUG(3, "cocosdc", "FDC emulation mode\n");
+			d->cmd_mode = 0;
+			d->buf_count = 0;
+			latch_write(d, D);
+		}
+		break;
+	case 0x2:
+		d->flash_data = D;
+		break;
+	case 0x3:
+		// bit 7 enables flash programming, which isn't emulated
+		if (!(D & 0x80))
+			d->bank = D & 7;
+		break;
+	default:
+		break;
+	}
 	return D;
+}
+
+static bool cocosdc_has_interface(struct cart *c, const char *ifname) {
+	return c && (0 == strcmp(ifname, "floppy"));
+}
+
+static void cocosdc_attach_interface(struct cart *c, const char *ifname, void *intf) {
+	if (!c || (0 != strcmp(ifname, "floppy")))
+		return;
+	struct cocosdc *d = (struct cocosdc *)c;
+	d->vdrive_interface = intf;
+
+	d->fdc->set_dirc = DELEGATE_AS1(void, bool, d->vdrive_interface->set_dirc, d->vdrive_interface);
+	d->fdc->set_dden = DELEGATE_AS1(void, bool, d->vdrive_interface->set_dden, d->vdrive_interface);
+	d->fdc->set_drq = DELEGATE_AS1(void, bool, set_drq, d);
+	d->fdc->set_intrq = DELEGATE_AS1(void, bool, set_intrq, d);
+	d->fdc->step = DELEGATE_AS0(void, d->vdrive_interface->step, d->vdrive_interface);
+	d->fdc->write = DELEGATE_AS1(void, uint8, d->vdrive_interface->write, d->vdrive_interface);
+	d->fdc->skip = DELEGATE_AS0(void, d->vdrive_interface->skip, d->vdrive_interface);
+	d->fdc->read = DELEGATE_AS0(uint8, d->vdrive_interface->read, d->vdrive_interface);
+	d->fdc->write_idam = DELEGATE_AS0(void, d->vdrive_interface->write_idam, d->vdrive_interface);
+	d->fdc->time_to_next_byte = DELEGATE_AS0(unsigned, d->vdrive_interface->time_to_next_byte, d->vdrive_interface);
+	d->fdc->time_to_next_idam = DELEGATE_AS0(unsigned, d->vdrive_interface->time_to_next_idam, d->vdrive_interface);
+	d->fdc->next_idam = DELEGATE_AS0(uint8p, d->vdrive_interface->next_idam, d->vdrive_interface);
+	d->fdc->update_connection = DELEGATE_AS0(void, d->vdrive_interface->update_connection, d->vdrive_interface);
+
+	d->vdrive_interface->tr00 = DELEGATE_AS1(void, bool, wd279x_tr00, d->fdc);
+	d->vdrive_interface->index_pulse = DELEGATE_AS1(void, bool, wd279x_index_pulse, d->fdc);
+	d->vdrive_interface->write_protect = DELEGATE_AS1(void, bool, wd279x_write_protect, d->fdc);
+	wd279x_update_connection(d->fdc);
+
+	// tied high
+	wd279x_ready(d->fdc, 1);
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-static void latch_write(struct cocosdc *n, unsigned D) {
-	if (D != n->latch_old) {
-		LOG_MOD_DEBUG(2, "cocosdc", "config reg: ");
-		if ((D ^ n->latch_old) & 0x03) {
-			LOG_DEBUG(2, "DRIVE SELECT %01u, ", D & 0x03);
-		}
-		if ((D ^ n->latch_old) & 0x04) {
-			LOG_DEBUG(2, "MOTOR %s, ", (D & 0x04)?"ON":"OFF");
-		}
-		if ((D ^ n->latch_old) & 0x08) {
-			LOG_DEBUG(2, "DENSITY %s, ", (D & 0x08)?"SINGLE":"DOUBLE");
-		}
-		if ((D ^ n->latch_old) & 0x10) {
-			LOG_DEBUG(2, "PRECOMP %s, ", (D & 0x10)?"ON":"OFF");
-		}
-		if ((D ^ n->latch_old) & 0x20) {
-			LOG_DEBUG(2, "NMI %s, ", (D & 0x20)?"ENABLED":"DISABLED");
-		}
-		LOG_DEBUG(2, "\n");
-		n->latch_old = D;
+// FDC emulation: the same control latch as the RS-DOS cartridge
+
+static void latch_write(struct cocosdc *d, unsigned D) {
+	struct cart *c = (struct cart *)d;
+	unsigned new_drive_select = 0;
+	D ^= 0x20;
+	if (D & 0x01) {
+		new_drive_select = 0;
+	} else if (D & 0x02) {
+		new_drive_select = 1;
+	} else if (D & 0x04) {
+		new_drive_select = 2;
+	} else if (D & 0x40) {
+		new_drive_select = 3;
+		D &= ~0x40;  // prevent interpreting as side select
 	}
-	n->latch_drive_select = D & 0x03;
-	n->latch_motor_enable = D & 0x04;
-	n->latch_density = D & 0x08;
-	n->latch_precomp_enable = D & 0x10;
-	n->latch_nmi_enable = D & 0x20;
+	d->latch_old = D;
+	d->latch_drive_select = new_drive_select;
+	if (d->vdrive_interface) {
+		d->vdrive_interface->set_sso(d->vdrive_interface, (D & 0x40) ? 1 : 0);
+		d->vdrive_interface->set_drive(d->vdrive_interface, d->latch_drive_select);
+	}
+	d->latch_density = D & 0x20;
+	wd279x_set_dden(d->fdc, !d->latch_density);
+	if (!d->latch_density && d->intrq_flag) {
+		DELEGATE_CALL(c->signal_nmi, 1);
+	}
+	d->halt_enable = (D & 0x80) && !d->intrq_flag;
+	DELEGATE_CALL(c->signal_halt, d->halt_enable && !d->drq_flag);
 }
 
-/*
 static void set_drq(void *sptr, bool value) {
-	struct cocosdc *n = sptr;
-	struct cart *c = &n->cart;
-	DELEGATE_CALL(c->signal_firq, value);
+	struct cocosdc *d = sptr;
+	struct cart *c = &d->cart;
+	d->drq_flag = value;
+	DELEGATE_CALL(c->signal_halt, d->halt_enable && !d->drq_flag);
 }
 
 static void set_intrq(void *sptr, bool value) {
-	struct cocosdc *n = sptr;
-	struct cart *c = &n->cart;
+	struct cocosdc *d = sptr;
+	struct cart *c = &d->cart;
+	d->intrq_flag = value;
 	if (value) {
-		if (n->latch_nmi_enable) {
+		d->halt_enable = 0;
+		DELEGATE_CALL(c->signal_halt, 0);
+		if (!d->latch_density && d->intrq_flag) {
 			DELEGATE_CALL(c->signal_nmi, 1);
 		}
 	} else {
 		DELEGATE_CALL(c->signal_nmi, 0);
 	}
 }
-*/
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+// SD card: host paths
+
+// Convert a host file name to 8.3 form.  Returns false if it doesn't fit.
+
+static bool name_83(const char *s, char name[8], char ext[3]) {
+	memset(name, ' ', 8);
+	memset(ext, ' ', 3);
+	if (strcmp(s, ".") == 0 || strcmp(s, "..") == 0) {
+		memcpy(name, s, strlen(s));
+		return 1;
+	}
+	const char *dot = strrchr(s, '.');
+	size_t nlen = dot ? (size_t)(dot - s) : strlen(s);
+	size_t elen = dot ? strlen(dot + 1) : 0;
+	if (nlen < 1 || nlen > 8 || elen > 3)
+		return 0;
+	for (size_t i = 0; i < nlen; i++) {
+		if (s[i] == '.' || s[i] == ' ' || (unsigned char)s[i] > 0x7e)
+			return 0;
+		name[i] = toupper((unsigned char)s[i]);
+	}
+	for (size_t i = 0; i < elen; i++) {
+		if ((unsigned char)dot[1 + i] > 0x7e || dot[1 + i] == ' ')
+			return 0;
+		ext[i] = toupper((unsigned char)dot[1 + i]);
+	}
+	return 1;
+}
+
+// Find a directory entry matching name case-insensitively (FAT names aren't
+// case sensitive).  Returns a new sds, or NULL.
+
+static sds find_entry(const char *dir, const char *name) {
+	DIR *dh = opendir(dir);
+	if (!dh)
+		return NULL;
+	sds found = NULL;
+	struct dirent *de;
+	while ((de = readdir(dh))) {
+		if (strcasecmp(de->d_name, name) == 0) {
+			found = sdsnew(de->d_name);
+			break;
+		}
+	}
+	closedir(dh);
+	return found;
+}
+
+// Resolve an SDC path name to a host path.  If must_exist is false, the leaf
+// need not exist (it's taken as given).  rel, if not NULL, receives the path
+// relative to the SD root.  Returns a new sds or NULL.
+
+static sds resolve_path(struct cocosdc *d, const char *path, bool must_exist, sds *rel) {
+	if (!d->sd_root)
+		return NULL;
+	sds r = (path[0] == '/') ? sdsempty() : sdsdup(d->cur_dir);
+	int ncomp;
+	sds *comp = sdssplitlen(path, strlen(path), "/", 1, &ncomp);
+	bool ok = 1;
+	for (int i = 0; i < ncomp && ok; i++) {
+		if (sdslen(comp[i]) == 0 || strcmp(comp[i], ".") == 0)
+			continue;
+		if (strcmp(comp[i], "..") == 0) {
+			char *slash = strrchr(r, '/');
+			if (slash)
+				sdsrange(r, 0, slash - r - 1);
+			else
+				sdsclear(r);
+			continue;
+		}
+		sds dir = sdscatfmt(sdsnew(d->sd_root), "/%S", r);
+		sds found = find_entry(dir, comp[i]);
+		sdsfree(dir);
+		if (!found) {
+			if (must_exist || i != ncomp - 1) {
+				ok = 0;
+				break;
+			}
+			found = sdsdup(comp[i]);
+		}
+		if (sdslen(r))
+			r = sdscat(r, "/");
+		r = sdscatsds(r, found);
+		sdsfree(found);
+	}
+	sdsfreesplitres(comp, ncomp);
+	if (!ok) {
+		sdsfree(r);
+		return NULL;
+	}
+	sds host = sdscatfmt(sdsnew(d->sd_root), "/%S", r);
+	if (rel)
+		*rel = r;
+	else
+		sdsfree(r);
+	return host;
+}
+
+// Fill a 32 byte FAT style directory record for a host file.
+
+static void fat_record(uint8_t *rec, const char *host) {
+	memset(rec, 0, 32);
+	const char *leaf = strrchr(host, '/');
+	leaf = leaf ? leaf + 1 : host;
+	name_83(leaf, (char *)rec, (char *)rec + 8);
+	struct stat st;
+	if (stat(host, &st) == 0) {
+		if (S_ISDIR(st.st_mode)) {
+			rec[11] = 0x10;
+		} else {
+			uint32_t size = st.st_size;
+			rec[28] = size;
+			rec[29] = size >> 8;
+			rec[30] = size >> 16;
+			rec[31] = size >> 24;
+		}
+	}
+}
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+// SD card: directory listings
+
+static bool match_part(const char *pat, size_t plen, const char *s, size_t slen) {
+	size_t i = 0;
+	for (; i < plen; i++) {
+		if (pat[i] == '*')
+			return 1;
+		char c = i < slen ? s[i] : ' ';
+		if (pat[i] != '?' && toupper((unsigned char)pat[i]) != c)
+			return 0;
+	}
+	for (; i < slen; i++) {
+		if (s[i] != ' ')
+			return 0;
+	}
+	return 1;
+}
+
+static bool match_83(const char *pat, const struct sdc_dirent *e) {
+	const char *dot = strchr(pat, '.');
+	size_t nlen = dot ? (size_t)(dot - pat) : strlen(pat);
+	if (!match_part(pat, nlen, e->name, 8))
+		return 0;
+	if (!dot)
+		return memcmp(e->ext, "   ", 3) == 0 || (nlen > 0 && pat[nlen - 1] == '*');
+	return match_part(dot + 1, strlen(dot + 1), e->ext, 3);
+}
+
+static int dirent_cmp(const void *a, const void *b) {
+	const struct sdc_dirent *ea = a, *eb = b;
+	int r = memcmp(ea->name, eb->name, 8);
+	return r ? r : memcmp(ea->ext, eb->ext, 3);
+}
+
+static uint8_t start_listing(struct cocosdc *d, const char *arg) {
+	free(d->listing);
+	d->listing = NULL;
+	d->listing_n = d->listing_pos = 0;
+
+	// Split into directory and wildcard pattern
+	const char *slash = strrchr(arg, '/');
+	sds dirpath = slash ? sdsnewlen(arg, slash - arg + 1) : sdsempty();
+	const char *pat = slash ? slash + 1 : arg;
+	if (!*pat)
+		pat = "*.*";
+	sds rel = NULL;
+	sds host = resolve_path(d, sdslen(dirpath) ? dirpath : ".", 1, &rel);
+	sdsfree(dirpath);
+	if (!host)
+		return STA_FAILED | STA_NOTFOUND;
+	DIR *dh = opendir(host);
+	if (!dh) {
+		sdsfree(host);
+		sdsfree(rel);
+		return STA_FAILED | STA_NOTFOUND;
+	}
+	unsigned alloc = 0;
+	struct dirent *de;
+	while ((de = readdir(dh))) {
+		struct sdc_dirent e = {0};
+		// The root directory has no "." or ".." entries
+		if (de->d_name[0] == '.' && (sdslen(rel) == 0 || (strcmp(de->d_name, ".") && strcmp(de->d_name, ".."))))
+			continue;
+		if (!name_83(de->d_name, e.name, e.ext))
+			continue;
+		if (!match_83(pat, &e))
+			continue;
+		sds p = sdscatfmt(sdsdup(host), "/%s", de->d_name);
+		struct stat st;
+		if (stat(p, &st) == 0) {
+			if (S_ISDIR(st.st_mode))
+				e.attr = 0x10;
+			else
+				e.size = st.st_size;
+		}
+		sdsfree(p);
+		if (d->listing_n == alloc) {
+			alloc = alloc ? alloc * 2 : 32;
+			d->listing = xrealloc(d->listing, alloc * sizeof(*d->listing));
+		}
+		d->listing[d->listing_n++] = e;
+	}
+	closedir(dh);
+	sdsfree(host);
+	sdsfree(rel);
+	if (d->listing_n)
+		qsort(d->listing, d->listing_n, sizeof(*d->listing), dirent_cmp);
+	return 0;
+}
+
+static uint8_t listing_page(struct cocosdc *d, uint8_t *page) {
+	memset(page, 0, 256);
+	for (unsigned i = 0; i < 16 && d->listing_pos < d->listing_n; i++) {
+		struct sdc_dirent *e = &d->listing[d->listing_pos++];
+		uint8_t *rec = page + i * 16;
+		memcpy(rec, e->name, 8);
+		memcpy(rec + 8, e->ext, 3);
+		rec[11] = e->attr;
+		rec[12] = e->size >> 24;
+		rec[13] = e->size >> 16;
+		rec[14] = e->size >> 8;
+		rec[15] = e->size;
+	}
+	return 0;
+}
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+// Command mode: mounted images
+
+static struct vdisk *drive_disk(struct cocosdc *d, unsigned drive) {
+	if (!d->vdrive_interface)
+		return NULL;
+	return vdrive_disk_in_drive(d->vdrive_interface, drive);
+}
+
+// Map a logical sector number to a cylinder, head and sector.  If ss is set,
+// the LSN assumes a single-sided disk.
+
+static bool lsn_chs(struct vdisk *disk, unsigned lsn, bool ss, unsigned *cyl, unsigned *head, unsigned *sector) {
+	unsigned heads = disk->num_heads ? disk->num_heads : 1;
+	unsigned track = lsn / SDC_SECTORS_PER_TRACK;
+	*sector = lsn % SDC_SECTORS_PER_TRACK + 1;
+	if (ss || heads == 1) {
+		*cyl = track;
+		*head = 0;
+	} else {
+		*cyl = track / heads;
+		*head = track % heads;
+	}
+	return *cyl < disk->num_cylinders;
+}
+
+static uint8_t read_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool ss) {
+	struct vdisk *disk = drive_disk(d, drive);
+	if (!disk)
+		return STA_FAILED | STA_NOTFOUND;
+	unsigned cyl, head, sector;
+	if (!lsn_chs(disk, lsn, ss, &cyl, &head, &sector))
+		return STA_FAILED | STA_NOTFOUND;
+	// vdisk_read_sector() doesn't check the data CRC reliably, so CRC
+	// errors aren't reported.
+	struct vdisk_ctx *ctx = vdisk_ctx_new(disk);
+	bool ok = vdisk_read_sector(ctx, cyl, head, sector, 256, d->buf);
+	vdisk_ctx_free(ctx);
+	return ok ? 0 : (STA_FAILED | STA_NOTFOUND);
+}
+
+static uint8_t write_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool ss) {
+	struct vdisk *disk = drive_disk(d, drive);
+	if (!disk)
+		return STA_FAILED | STA_NOTFOUND;
+	if (disk->write_protect)
+		return STA_FAILED | STA_INUSE;
+	unsigned cyl, head, sector;
+	if (!lsn_chs(disk, lsn, ss, &cyl, &head, &sector))
+		return STA_FAILED | STA_NOTFOUND;
+	struct vdisk_ctx *ctx = vdisk_ctx_new(disk);
+	bool ok = vdisk_write_sector(ctx, cyl, head, sector, 256, d->buf);
+	vdisk_ctx_free(ctx);
+	return ok ? 0 : (STA_FAILED | STA_NOTFOUND);
+}
+
+// Host path of the image in a drive.  Images may also have been inserted some
+// other way (-load-fd0, the UI), so the path comes from the drive.
+
+static const char *drive_path(struct cocosdc *d, unsigned drive) {
+	struct vdisk *disk = drive_disk(d, drive);
+	return disk ? disk->filename : NULL;
+}
+
+static void unmount(struct cocosdc *d, unsigned drive) {
+	if (drive_disk(d, drive))
+		xroar_eject_disk(drive);
+}
+
+// Mount a disk image through the floppy drives.
+
+static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path) {
+	if (!*path) {
+		unmount(d, drive);
+		return 0;
+	}
+	sds host = resolve_path(d, path, 1, NULL);
+	if (!host)
+		return STA_FAILED | STA_NOTFOUND;
+	struct stat st;
+	if (stat(host, &st) != 0 || S_ISDIR(st.st_mode)) {
+		sdsfree(host);
+		return STA_FAILED | STA_NOTFOUND;
+	}
+	const char *other = drive_path(d, drive ^ 1);
+	if (other && strcmp(other, host) == 0) {
+		sdsfree(host);
+		return STA_FAILED | STA_INUSE;
+	}
+	unmount(d, drive);
+	xroar_insert_disk_file(drive, host);
+	sdsfree(host);
+	return drive_disk(d, drive) ? 0 : (STA_FAILED | STA_INVALID);
+}
+
+static uint8_t set_dir(struct cocosdc *d, const char *path) {
+	sds rel = NULL;
+	sds host = resolve_path(d, *path ? path : "/", 1, &rel);
+	if (!host)
+		return STA_FAILED | STA_NOTFOUND;
+	struct stat st;
+	bool ok = stat(host, &st) == 0 && S_ISDIR(st.st_mode);
+	sdsfree(host);
+	if (!ok) {
+		sdsfree(rel);
+		return STA_FAILED | STA_NOTFOUND;
+	}
+	sdsfree(d->cur_dir);
+	d->cur_dir = rel;
+	return 0;
+}
+
+static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
+	char *arg = (char *)d->buf + 2;
+	d->buf[255] = 0;
+	if (!d->sd_root)
+		return STA_FAILED | STA_NOTFOUND;
+	if (d->buf[1] != ':')
+		return STA_FAILED | STA_INVALID;
+	switch (d->buf[0]) {
+	case 'M':
+		return mount_file(d, drive, arg);
+	case 'D':
+		return set_dir(d, arg);
+	case 'L':
+		return start_listing(d, arg);
+	case 'K': {
+		sds host = resolve_path(d, arg, 0, NULL);
+		uint8_t r = (host && mkdir(host, 0777) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
+		sdsfree(host);
+		return r;
+	}
+	case 'X': {
+		sds host = resolve_path(d, arg, 1, NULL);
+		uint8_t r = (host && remove(host) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
+		sdsfree(host);
+		return r;
+	}
+	default:
+		LOG_MOD_DEBUG(1, "cocosdc", "unsupported command '%c:'\n", d->buf[0]);
+		return STA_FAILED | STA_INVALID;
+	}
+}
+
+// Start sending a block to the CoCo, or finish with a status.
+
+static void send_block(struct cocosdc *d, uint8_t status) {
+	if (status) {
+		d->status = status;
+		d->buf_count = 0;
+		return;
+	}
+	d->buf_pos = 0;
+	d->buf_count = 256;
+	d->buf_rx = 0;
+	d->status = STA_BUSY | STA_READY;
+}
+
+static void ext_command(struct cocosdc *d, unsigned drive) {
+	switch (d->param[0]) {
+	case 'I': {
+		// Info for mounted image
+		const char *path = drive_path(d, drive);
+		if (!path) {
+			d->status = STA_FAILED | STA_NOTFOUND;
+			return;
+		}
+		memset(d->buf, 0, 256);
+		fat_record(d->buf, path);
+		send_block(d, 0);
+		return;
+	}
+	case 'Q': {
+		// Size of mounted image in sectors: the file size / 256
+		const char *path = drive_path(d, drive);
+		struct stat st;
+		if (!path || stat(path, &st) != 0) {
+			d->status = STA_FAILED | STA_NOTFOUND;
+			return;
+		}
+		unsigned n = st.st_size / 256;
+		d->param[0] = n >> 16;
+		d->param[1] = n >> 8;
+		d->param[2] = n;
+		d->status = 0;
+		return;
+	}
+	case 'C': {
+		// Current directory leaf
+		memset(d->buf, 0, 256);
+		if (sdslen(d->cur_dir) == 0) {
+			send_block(d, 0);
+			d->status |= STA_FAILED | STA_NOTFOUND;
+			return;
+		}
+		sds host = sdscatfmt(sdsnew(d->sd_root ? d->sd_root : ""), "/%S", d->cur_dir);
+		fat_record(d->buf, host);
+		sdsfree(host);
+		send_block(d, 0);
+		return;
+	}
+	case '>':
+		if (!d->listing) {
+			d->status = STA_FAILED;
+			return;
+		}
+		send_block(d, listing_page(d, d->buf));
+		return;
+	case 'V':
+		d->param[1] = SDC_VERSION >> 8;
+		d->param[2] = SDC_VERSION & 0xff;
+		d->status = 0;
+		return;
+	default:
+		LOG_MOD_DEBUG(1, "cocosdc", "unsupported extended command $%02x '%c'\n", d->param[0], d->param[0]);
+		d->status = STA_FAILED;
+		return;
+	}
+}
+
+// A block sent by the CoCo has been received.
+
+static void block_received(struct cocosdc *d) {
+	unsigned drive = d->cmd & 1;
+	unsigned lsn = (d->param[0] << 16) | (d->param[1] << 8) | d->param[2];
+	switch (d->cmd & 0xf0) {
+	case 0xa0:
+		d->status = write_lsn(d, drive, lsn, d->cmd & 2);
+		break;
+	case 0xe0:
+		d->status = sd_command(d, drive);
+		break;
+	default:
+		d->status = 0;
+		break;
+	}
+}
+
+static void command(struct cocosdc *d, uint8_t cmd) {
+	unsigned drive = cmd & 1;
+	unsigned lsn = (d->param[0] << 16) | (d->param[1] << 8) | d->param[2];
+	d->cmd = cmd;
+	d->buf_count = 0;
+	LOG_MOD_DEBUG(3, "cocosdc", "command $%02x params $%02x $%02x $%02x\n", cmd, d->param[0], d->param[1], d->param[2]);
+	switch (cmd & 0xf0) {
+	case 0x80:
+		d->byte_mode = cmd & 4;
+		send_block(d, read_lsn(d, drive, lsn, cmd & 2));
+		break;
+	case 0xa0:
+	case 0xe0:
+		d->byte_mode = (cmd & 0xf0) == 0xa0 && (cmd & 8);
+		d->buf_pos = 0;
+		d->buf_count = 256;
+		d->buf_rx = 1;
+		d->status = STA_BUSY | STA_READY;
+		break;
+	case 0xc0:
+		d->byte_mode = 0;
+		ext_command(d, drive);
+		break;
+	default:
+		LOG_MOD_DEBUG(1, "cocosdc", "unsupported command $%02x\n", cmd);
+		d->status = STA_FAILED;
+		break;
+	}
+}
+
+static void cmd_write(struct cocosdc *d, unsigned reg, uint8_t D) {
+	if (reg == 0) {
+		command(d, D);
+		return;
+	}
+	if (d->buf_count && d->buf_rx && (reg == 3 || (reg == 2 && !d->byte_mode))) {
+		d->buf[d->buf_pos++] = D;
+		if (--d->buf_count == 0)
+			block_received(d);
+		return;
+	}
+	d->param[reg - 1] = D;
+}
+
+static uint8_t cmd_read(struct cocosdc *d, unsigned reg) {
+	if (reg == 0)
+		return d->status;
+	if (d->buf_count && !d->buf_rx && (reg == 3 || (reg == 2 && !d->byte_mode))) {
+		uint8_t v = d->buf[d->buf_pos++];
+		if (--d->buf_count == 0 && !(d->status & STA_FAILED))
+			d->status = 0;
+		else if (d->buf_count == 0)
+			d->status &= ~(STA_BUSY | STA_READY);
+		return v;
+	}
+	return d->param[reg - 1];
+}
