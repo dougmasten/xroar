@@ -959,6 +959,39 @@ static uint8_t set_dir(struct cocosdc *d, const char *path) {
 	return 0;
 }
 
+// Rename a file or directory.  Both path names are relative to the current
+// directory, so a file can also be moved.  As on FAT, the new name must be a
+// valid 8.3 name that doesn't exist already, and a mounted file can't be
+// renamed.
+
+static uint8_t rename_file(struct cocosdc *d, const char *from, const char *to) {
+	sds old = resolve_path(d, from, 1, NULL);
+	sds new = resolve_path(d, to, 0, NULL);
+	char name[8], ext[3];
+	struct stat st;
+	uint8_t r = 0;
+	if (!old || !new) {
+		r = STA_FAILED | STA_NOTFOUND;
+	} else if (!name_83(strrchr(new, '/') + 1, name, ext)) {
+		r = STA_FAILED | STA_INVALID;
+	} else if (strcmp(old, new) == 0) {
+		// Same name (resolved case-insensitively): nothing to do
+	} else if (stat(new, &st) == 0) {
+		r = STA_FAILED | STA_INUSE;
+	} else {
+		for (unsigned i = 0; i < 2; i++) {
+			const char *path = drive_path(d, i);
+			if (path && strcmp(path, old) == 0)
+				r = STA_FAILED | STA_INUSE;
+		}
+		if (!r && rename(old, new) != 0)
+			r = STA_FAILED | STA_NOTFOUND;
+	}
+	sdsfree(old);
+	sdsfree(new);
+	return r;
+}
+
 static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 	char *arg = (char *)d->buf + 2;
 	d->buf[255] = 0;
@@ -984,6 +1017,13 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 		uint8_t r = (host && mkdir(host, 0777) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
 		sdsfree(host);
 		return r;
+	}
+	case 'R': {
+		// The new name follows the old one's terminating NUL
+		const char *to = arg + strlen(arg) + 1;
+		if (to >= (char *)d->buf + 256)
+			return STA_FAILED | STA_INVALID;
+		return rename_file(d, arg, to);
 	}
 	case 'X': {
 		sds host = resolve_path(d, arg, 1, NULL);
