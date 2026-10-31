@@ -17,6 +17,7 @@
  * - CoCo SDC User Guide (Darren Atkinson)
  * - CoCo SDC Technical Info
  * - VCC's CoCo SDC emulation (sdc.cpp)
+ * - Disassembly of SDC-DOS 1.75 and the MCU firmware
  */
 
 /* The CoCo SDC is a floppy controller replacement.  In "FDC emulation" mode
@@ -127,6 +128,7 @@ struct cocosdc {
 	unsigned buf_count;  // bytes left to transfer
 	bool buf_rx;  // block is being sent by the CoCo
 	bool byte_mode;  // block transferred 8 bits at a time through $FF4B
+	uint8_t flags;  // MCU option byte, set by the undocumented 'g' command
 
 	// SD card
 	int msgr_client_id;
@@ -158,6 +160,7 @@ static const struct ser_struct ser_struct_cocosdc[] = {
 	SER_ID_STRUCT_ELEM(8, struct cocosdc, flash_data),
 	SER_ID_STRUCT_ELEM(9, struct cocosdc, cmd_mode),
 	SER_ID_STRUCT_ELEM(10, struct cocosdc, status),
+	SER_ID_STRUCT_ELEM(11, struct cocosdc, flags),
 };
 
 static const struct ser_struct_data cocosdc_ser_struct_data = {
@@ -332,6 +335,7 @@ static void cocosdc_reset(struct cart *c, bool hard) {
 	if (hard) {
 		d->bank = 0;
 		d->flash_data = 0;
+		d->flags = 0;
 		if (d->sd_root)
 			load_startup_cfg(d);
 	}
@@ -1056,6 +1060,22 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 			return;
 		}
 		send_block(d, listing_page(d, d->buf));
+		return;
+	case 'e':
+		// Undocumented, sent by SDC-DOS before opening files: response
+		// byte 3 flags the drives (bit per drive select line) it should
+		// access through FDC emulation instead of logical sectors.
+		// Every image works by logical sector here, so none are flagged.
+		d->param[2] = 0;
+		d->status = 0;
+		return;
+	case 'g':
+		// Undocumented: update the MCU option byte, flags = (flags AND
+		// byte 2) OR byte 3.  SDC-DOS clears bit 0 for RUN @n and sets
+		// it for RUN @n,R before switching bank.  The firmware tests bit
+		// 7 in its FDC emulation; nothing here depends on either bit.
+		d->flags = (d->flags & d->param[1]) | d->param[2];
+		d->status = 0;
 		return;
 	case 'V':
 		d->param[1] = SDC_VERSION >> 8;
