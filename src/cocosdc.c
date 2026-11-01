@@ -34,12 +34,13 @@
  * -load-fd1 mount images in them.  The SD card is a host directory given
  * with -load-hd0; commands that mount images or list directories work
  * within it, and its STARTUP.CFG mounts images at power up.  As on the real
- * card, only names that fit 8.3 are visible, matched case-insensitively, and
- * "M:" accepts wildcards and a name without its extension.  A file can
- * also be mounted as an array of raw 256 byte blocks ("m:"), accessible by
- * logical sector number or streaming but not through FDC emulation.
- * Mounting a directory in drive 0 mounts a disk set: images in it named
- * "FOO1.DSK" to "FOO9.DSK", switched with the '#' and '+' commands.
+ * card, only names that fit 8.3 (without a '~') are visible, matched
+ * case-insensitively, and "M:" accepts wildcards and a name without its
+ * extension.  A file can also be mounted as an array of raw 256 byte blocks
+ * ("m:"), accessible by logical sector number or streaming but not through
+ * FDC emulation.  Mounting a directory in drive 0 mounts a disk set: images
+ * in it named "FOO1.DSK" to "FOO9.DSK", switched with the '#' and '+'
+ * commands.
  *
  * The 128K of flash is eight 16K banks mapped at $C000-$FEFF.  By default
  * bank 0 holds SDC-DOS, bank 1 RS-DOS, bank 4 "dplus-sdc" and bank 5 a
@@ -988,6 +989,13 @@ static bool name_83(const char *s, char name[8], char ext[3]) {
 	return 1;
 }
 
+// Whether the firmware lists a host file, and its 8.3 name if so.  Names
+// with a '~' are hidden: on FAT, they're the short aliases of long names.
+
+static bool visible_83(const char *s, char name[8], char ext[3]) {
+	return name_83(s, name, ext) && !strchr(s, '~');
+}
+
 // Convert a name given by the CoCo to an 11 character 8.3 pattern, as the
 // firmware does: upper case, padded with spaces, and if wild is set, '*' and
 // '?' as wildcards ('*' fills the rest of the name or extension with '?').
@@ -1044,7 +1052,7 @@ static sds find_entry(const char *dir, const char pat[11]) {
 	struct dirent *de;
 	while ((de = readdir(dh))) {
 		char name[11];
-		if (de->d_name[0] == '.' || !name_83(de->d_name, name, name + 8))
+		if (de->d_name[0] == '.' || !visible_83(de->d_name, name, name + 8))
 			continue;
 		bool match = 1;
 		for (unsigned i = 0; i < 11 && match; i++)
@@ -1233,7 +1241,7 @@ static uint8_t start_listing(struct cocosdc *d, const char *arg) {
 		// The root directory has no "." or ".." entries
 		if (de->d_name[0] == '.' && (sdslen(rel) == 0 || (strcmp(de->d_name, ".") && strcmp(de->d_name, ".."))))
 			continue;
-		if (!name_83(de->d_name, e.name, e.ext))
+		if (!visible_83(de->d_name, e.name, e.ext))
 			continue;
 		if (!match_83(pat, &e))
 			continue;
@@ -1525,7 +1533,7 @@ static sds set_member(const char *dir, char ch) {
 	struct dirent *de;
 	while ((de = readdir(dh))) {
 		struct sdc_dirent e = {0};
-		if (de->d_name[0] == '.' || !name_83(de->d_name, e.name, e.ext))
+		if (de->d_name[0] == '.' || !visible_83(de->d_name, e.name, e.ext))
 			continue;
 		int i = 7;
 		while (i > 0 && e.name[i] == ' ')

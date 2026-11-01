@@ -1092,8 +1092,9 @@ card holding disk images.  Its emulation is experimental: it's only available
 if XRoar was configured with @option{--enable-experimental}.
 
 The SD card is a directory on the host, given with @option{-load-hd0
-@var{dir}}.  As on the real card, only files whose names fit 8.3 are visible,
-and names match regardless of case.  A @file{STARTUP.CFG} in that directory
+@var{dir}}.  As on the real card, only files whose names fit 8.3 are visible
+(except names containing @samp{~}, which on FAT are the short forms of long
+names), and names match regardless of case.  A @file{STARTUP.CFG} in that directory
 mounts images at power up, one per line: @samp{0=@var{file}} and
 @samp{1=@var{file}} for the drives, @samp{D=@var{dir}} for the current
 directory.
