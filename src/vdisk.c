@@ -1166,6 +1166,22 @@ static uint8_t read_byte(struct vdisk_ctx *ctx) {
 	return data;
 }
 
+// Start a CRC at the current position, which holds an address mark.  Like
+// the CoCo SDC, include the three bytes stored before it in double density:
+// normally the $A1 syncs.
+
+static void crc_preset(struct vdisk_ctx *ctx) {
+	ctx->crc = CRC16_CCITT_RESET;
+	if (!ctx->dden || !ctx->track_data)
+		return;
+	for (unsigned i = 3; i > 0; i--) {
+		unsigned p = ctx->head_pos - i;
+		if (p < 128)
+			p += ctx->disk->track_length - 128;
+		ctx->crc = crc16_ccitt_byte(ctx->crc, ctx->track_data[p]);
+	}
+}
+
 // Read CRC bytes and return 1 if valid.
 
 static bool read_crc(struct vdisk_ctx *ctx) {
@@ -1345,10 +1361,43 @@ bool vdisk_write_sector(struct vdisk_ctx *ctx, unsigned cyl, unsigned head,
 
 // Similarly, locate a sector and copy out its data.
 
+// Copy out the data field following an ID just read.  The data mark ($F8 to
+// $FB, after $A1 syncs in double density) must follow within 43 bytes.
+
+static bool read_data(struct vdisk_ctx *ctx, const struct vdisk_idam *vidam,
+		      unsigned ssize, uint8_t *buf) {
+	uint8_t prev = 0;
+	unsigned j;
+	for (j = 0; j < 43; j++) {
+		unsigned pos = ctx->head_pos;
+		uint8_t b = read_byte(ctx);
+		if (b >= 0xf8 && b <= 0xfb && (!ctx->dden || prev == 0xa1)) {
+			ctx->head_pos = pos;
+			crc_preset(ctx);
+			(void)read_byte(ctx);
+			break;
+		}
+		prev = b;
+	}
+	if (j >= 43) {
+		vdisk_errno = vdisk_err_dam_not_found;
+		return 0;
+	}
+	unsigned vseclen = 128 << (vidam->ssize_code & 3);
+	j = 0;
+	while (j < ssize && j < vseclen)
+		buf[j++] = read_byte(ctx);
+	for (; j < vseclen; j++)
+		(void)read_byte(ctx);
+	ctx->data_crc_error = !read_crc(ctx);
+	return 1;
+}
+
 bool vdisk_read_sector(struct vdisk_ctx *ctx, unsigned cyl, unsigned head,
 			unsigned sector, unsigned ssize, uint8_t *buf) {
 
 	struct vdisk_idam vidam;
+	int bad = -1;
 
 	memset(buf, 0, ssize);
 	for (unsigned i = 0; i < 64; i++) {
@@ -1359,25 +1408,21 @@ bool vdisk_read_sector(struct vdisk_ctx *ctx, unsigned cyl, unsigned head,
 
 		// not currently testing that stored track number matches
 		if (vidam.sector == sector) {
-			ctx->idam_crc_error = (vidam.crc != 0);
-			unsigned j;
-			for (j = 0; j < 43; j++) {
-				if (read_byte(ctx) == 0xfb)
-					break;
+			// Prefer an ID with a good CRC
+			if (vidam.crc != 0) {
+				if (bad < 0)
+					bad = i;
+				continue;
 			}
-			if (j >= 43) {
-				vdisk_errno = vdisk_err_dam_not_found;
-				return 0;
-			}
-			unsigned vseclen = 128 << (vidam.ssize_code & 3);
-			j = 0;
-			while (j < ssize && j < vseclen)
-				buf[j++] = read_byte(ctx);
-			for (; j < vseclen; j++)
-				(void)read_byte(ctx);
-			ctx->data_crc_error = !read_crc(ctx);
-			return 1;
+			ctx->idam_crc_error = 0;
+			return read_data(ctx, &vidam, ssize, buf);
 		}
+	}
+
+	// Otherwise read the sector anyway, flagging the CRC error
+	if (bad >= 0 && vdisk_read_idam(ctx, &vidam, cyl, head, bad)) {
+		ctx->idam_crc_error = 1;
+		return read_data(ctx, &vidam, ssize, buf);
 	}
 
 	vdisk_errno = vdisk_err_sector_not_found;
@@ -1411,20 +1456,16 @@ bool vdisk_read_idam(struct vdisk_ctx *ctx, struct vdisk_idam *vidam,
 	ctx->dden = ctx->idam_data[idam] & VDISK_DOUBLE_DENSITY;
 	ctx->head_pos = head_pos;
 
+	crc_preset(ctx);
 	(void)read_byte(ctx);  // skip idam byte
-	ctx->crc = CRC16_CCITT_RESET;
-	if (ctx->dden) {
-		ctx->crc = crc16_ccitt_byte(ctx->crc, 0xa1);
-		ctx->crc = crc16_ccitt_byte(ctx->crc, 0xa1);
-		ctx->crc = crc16_ccitt_byte(ctx->crc, 0xa1);
-	}
 	vidam->valid = 1;
 	vidam->cyl = read_byte(ctx);
 	vidam->side = read_byte(ctx);
 	vidam->sector = read_byte(ctx);
 	vidam->ssize_code = read_byte(ctx);
-	vidam->crc = read_byte(ctx) << 8;
-	vidam->crc |= read_byte(ctx);
+	(void)read_byte(ctx);
+	(void)read_byte(ctx);
+	vidam->crc = ctx->crc;
 
 	return 1;
 }

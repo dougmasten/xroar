@@ -106,7 +106,7 @@ struct vdisk_idam {
 	unsigned side;
 	unsigned sector;
 	unsigned ssize_code;
-	unsigned crc;
+	unsigned crc;  // CRC check: zero if valid
 };
 
 enum vdisk_density {
