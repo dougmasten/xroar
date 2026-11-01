@@ -107,7 +107,7 @@
 
 // Command timing, measured on a real CoCo SDC.  These are set by the MCU and
 // were the same with every card tried.
-#define T_ACCEPT  EVENT_US(60)    // until a command or block is accepted
+#define T_ACCEPT  EVENT_US(45)    // until a command or block is accepted
 #define T_EXT     EVENT_US(220)   // extended command not using the card
 #define T_INFO    EVENT_US(260)   // 'I' and 'C'
 #define T_LIST    EVENT_US(140)   // "L:" (the directory is read by '>')
@@ -126,6 +126,10 @@
 #define T_DIRPAGE  (3 * T_SD_READ)  // a page of directory listing
 
 #define SD_BLOCK_NONE (~0U)
+// The directory entry of the image in a drive, read by 'I' and 'Q'
+#define SD_BLOCK_ENTRY(drive) (((drive) << 24) | 0xffffff)
+// A new directory's cluster is zeroed: 32K clusters are usual on FAT32 cards
+#define SD_CLUSTER_BLOCKS (64)
 
 struct sdc_dirent {
 	char name[8];
@@ -817,6 +821,16 @@ static void sd_flush(struct cocosdc *d) {
 	}
 }
 
+// Bring the block holding a drive's directory entry into the buffer.
+
+static void sd_entry(struct cocosdc *d, unsigned drive) {
+	if (d->sd_block != SD_BLOCK_ENTRY(drive)) {
+		sd_flush(d);
+		d->delay += T_SD_READ;
+		d->sd_block = SD_BLOCK_ENTRY(drive);
+	}
+}
+
 // Bring the SD block holding a logical sector into the buffer.  A sector
 // write needs the whole block too, so it's read first.
 
@@ -1067,8 +1081,8 @@ static uint8_t set_select(struct cocosdc *d, unsigned mode) {
 	d->set_dir = NULL;
 	unsigned num = d->set_num;
 	unsigned tries = mode ? 2 : 9;
-	// Remounting the same image finds its first block still buffered
-	sds old = (d->sd_block == 0 && drive_path(d, 0)) ? sdsnew(drive_path(d, 0)) : NULL;
+	// Remounting the same image doesn't read its first block again
+	sds old = drive_path(d, 0) ? sdsnew(drive_path(d, 0)) : NULL;
 	do {
 		unmount(d, 0);
 		char ch;
@@ -1086,11 +1100,13 @@ static uint8_t set_select(struct cocosdc *d, unsigned mode) {
 			if (!old || strcmp(old, host) != 0)
 				d->delay += T_SD_READ;
 			sd_flush(d);
-			d->sd_block = 0;
 			xroar_insert_disk_file(0, host);
 		}
 		sdsfree(host);
 		if (drive_disk(d, 0)) {
+			// The set's directory, holding the image's entry, is
+			// left in the buffer
+			d->sd_block = SD_BLOCK_ENTRY(0);
 			sdsfree(old);
 			d->set_dir = dir;
 			d->set_num = ch - '0';
@@ -1138,6 +1154,7 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 	if (!host)
 		return STA_FAILED | STA_NOTFOUND;
 	struct stat st;
+	bool created = 0;
 	if (stat(host, &st) != 0) {
 		if (!create) {
 			sdsfree(host);
@@ -1152,6 +1169,7 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 		d->delay += T_SD_WRITE;
 		uint8_t r = raw ? 0 : new_image(d, f);
 		fclose(f);
+		created = !raw;
 		if (r) {
 			// Like the real controller, this leaves the empty file
 			sdsfree(host);
@@ -1187,7 +1205,15 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 	}
 	xroar_insert_disk_file(drive, host);
 	sdsfree(host);
-	return drive_disk(d, drive) ? 0 : (STA_FAILED | STA_INVALID);
+	if (!drive_disk(d, drive))
+		return STA_FAILED | STA_INVALID;
+	if (created) {
+		// The firmware writes the new image's first block last, and
+		// its directory entry needs the final size
+		d->sd_dirty = 1;
+		d->drv[drive].written = 1;
+	}
+	return 0;
 }
 
 // STARTUP.CFG in the SD card's root directory lists images for the
@@ -1300,16 +1326,21 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 	case 'K': {
 		// As in the firmware, an existing directory is fine, but not
 		// a file of that name
-		d->delay += T_DIR + 2 * T_SD_WRITE;
+		d->delay += T_DIR;
 		sds host = resolve_path(d, arg, 0, NULL);
 		struct stat st;
 		uint8_t r;
-		if (!host)
+		if (!host) {
 			r = STA_FAILED | STA_NOTFOUND;
-		else if (stat(host, &st) == 0)
+		} else if (stat(host, &st) == 0) {
 			r = S_ISDIR(st.st_mode) ? 0 : (STA_FAILED | STA_INUSE);
-		else
+		} else {
 			r = (mkdir(host, 0777) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
+			// Zeroing the new cluster dominates, then the entry, the
+			// FAT and the "." and ".." entries
+			if (!r)
+				d->delay += SD_CLUSTER_BLOCKS * T_SD_WRITE + 2 * (T_SD_READ + T_SD_WRITE) + T_SD_WRITE;
+		}
 		sdsfree(host);
 		return r;
 	}
@@ -1357,6 +1388,7 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 			d->status = STA_FAILED | STA_NOTFOUND;
 			return;
 		}
+		sd_entry(d, drive);
 		memset(d->buf, 0, 256);
 		fat_record(d->buf, path);
 		if (drive_sdf(d, drive))
@@ -1366,13 +1398,14 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 	}
 	case 'Q': {
 		// Size of mounted image in sectors: the file size / 256
-		d->delay = T_SD_READ;
+		d->delay = T_INFO;
 		const char *path = drive_path(d, drive);
 		struct stat st;
 		if (!path || stat(path, &st) != 0) {
 			d->status = STA_FAILED | STA_NOTFOUND;
 			return;
 		}
+		sd_entry(d, drive);
 		unsigned n = st.st_size / 256;
 		d->param[0] = n >> 16;
 		d->param[1] = n >> 8;
