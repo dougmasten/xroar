@@ -1,0 +1,2 @@
+DONE
+flash 131072 bank 3 ok

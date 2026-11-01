@@ -1,0 +1,2 @@
+# The emulated firmware version
+:

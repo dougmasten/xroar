@@ -1,0 +1,42 @@
+V             10    201 00
+Q             77   1549 00
+I             12    241 03
+RD 0          69   1388 03
+RD 0 AGAIN     4     80 03
+RD 1           4     80 03
+RD 2          69   1388 03
+RD 3           4     80 03
+RD 300        69   1388 03
+RD 301         4     80 03
+RD 18         69   1388 03
+M ACCEPT       2     40 03
+M DONE       258   5189 90
+N ACCEPT       2     40 03
+N DONE     47388 953176 00
+WR0 ACC        2     40 03
+WR0 DONE      14    282 00
+WR0 ACC        2     40 03
+WR0 DONE      14    282 00
+WR0 ACC        2     40 03
+WR0 DONE      14    282 00
+WR0 ACC        2     40 03
+WR0 DONE      14    282 00
+WR1 ACC        2     40 03
+WR1 DONE      14    282 00
+WR2 ACC        2     40 03
+WR2 DONE     228   4586 00
+WR300 ACC      2     40 03
+WR300 DONE   228   4586 00
+RB 0         218   4385 03
+RB 300        69   1388 03
+L ACCEPT       2     40 03
+L DONE         6    121 00
+DIR PAGE     193   3882 03
+STREAM 1      20    402 03
+STREAM 2      10    201 03
+STREAM 3      10    201 03
+STREAM 4      10    201 03
+STREAM 5      10    201 03
+ABORT         85   1710 08
+UNMNT ACC      2     40 03
+UNMNT DONE   213   4284 00

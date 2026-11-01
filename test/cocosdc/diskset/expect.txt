@@ -1,0 +1,9 @@
+- 0 ST 0 G1
++ 0 ST 0 G2
++ 0 ST 0 G3
++ 0 ST 0 G5
++ 0 ST 0 G1
++ 0 ST 0 G2
+# 3 ST 0 G3
+# 4 ST 144 G3
+# 9 ST 144 G3

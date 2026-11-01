@@ -1,0 +1,58 @@
+CoCo SDC regression tests
+=========================
+
+These run 6809 test programs under XRoar's CoCo SDC emulation and compare
+what they report with the expected results.
+
+    ./run-tests.sh [-k] [-u] XROAR SDCDOS-ROM [TEST...]
+
+XROAR is an XRoar binary built with --enable-experimental, SDCDOS-ROM the
+CoCo 3 build of SDC-DOS (bank 0 of the cartridge's flash, without the
+5-byte header it has on the SDC setup disk).  Tests run on an emulated
+CoCo 3, so XRoar needs its CoCo 3 ROMs.  The suite needs lwasm, decb
+(ToolShed) and python3.  With no TEST, every test is run.
+
+-k keeps each test's working directory (a failing test's is always kept).
+-u writes each test's output to its expect.txt instead of comparing: check
+the differences before committing them.
+
+Tests
+-----
+
+Each directory is a test:
+
+    t.bas       BASIC program, run from T.DSK in drive 0
+    *.asm       assembled and copied to T.DSK as NAME.BIN
+    setup.sh    optional: fills the SD card directory, sd
+    run.sh      optional: runs XRoar and prints the results
+    expect.txt  the expected results
+
+The SD card starts holding T.DSK, mounted in drive 0 by STARTUP.CFG.
+setup.sh and run.sh are sourced by run-tests.sh in the test's working
+directory, with these helpers:
+
+    mkdsk IMG [FILE...]  make a Disk BASIC image holding FILEs
+    mksdf [OPT...] IMG   make an SDF image (see mksdf.py)
+    xr [ARG...]          run XRoar on sd, for $TIMEOUT emulated seconds
+    out_txt [IMG]        print OUT.TXT from IMG (default sd/T.DSK)
+
+setup.sh can set TYPE (what's typed into BASIC, default RUN"T") and
+TIMEOUT (default 60).  Without run.sh, a test runs XRoar typing TYPE and
+prints OUT.TXT.  Files on the SD card are given a fixed date, as the SDC
+reports dates in directory listings.
+
+    crc       reading sectors with bad ID or data CRCs, or missing
+    diskset   '+' and '#' with a disk set
+    flash     KILL MEM / WRITE MEM, and the flash file
+    hidden    names containing '~' are hidden
+    names     M:, N: and D: name matching, wildcards, long names
+    newsdf    creating SDF images with N:
+    sdctime   time taken by each command (the timing model)
+    settime   time taken by disk set commands
+    snapshot  snapshots taken mid-command restore and finish the same
+    version   the firmware version
+    wp        write protection from SDF headers and read-only files
+
+sdctime and settime were written to measure a real SDC, and their source
+says how.  On hardware they report somewhat different times: the SD card's
+own times vary from card to card.

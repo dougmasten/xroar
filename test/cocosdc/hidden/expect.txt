@@ -1,0 +1,5 @@
+M:AAA^1.DSK     90            
+M:A*            00 ABC     DSK
+M:ABC.DSK       00 ABC     DSK
+M:SET           90 ABC     DSK
+M:T.DSK         00 ABC     DSK

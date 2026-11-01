@@ -1,0 +1,18 @@
+M:GAME          00 GAME    DSK
+M:game2.dsk     00 GAME2   DSK
+M:GAM*          00 GAME    DSK
+M:G*.DSK        00 GAME    DSK
+M:*.DSK         00 GAME    DSK
+M:G?MMA.DSK     00 GAMMA   DSK
+M:NOEXT         00 NOEXT      
+M:LONGNAME1.DSK 84 NOEXT      
+M:MISSING       90 NOEXT      
+M:DEMO/X        00 X       DSK
+M:D*/X.DSK      84 X       DSK
+M:T.DSK         A0 X       DSK
+N:new.dsk       00 NEW     DSK
+N:BAD*.DSK      84 NEW     DSK
+D:DE*           00 NEW     DSK
+M:X             00 X       DSK
+D:/             00 X       DSK
+M:              00            
