@@ -114,9 +114,9 @@
 #define STA_WPROT    (0x40)
 #define STA_FAILED   (0x80)
 
-// Firmware version reported by the 'V' command (BCD): 1.27, from February
-// 2023, the latest release
-#define SDC_VERSION (0x0127)
+// Firmware version reported by the 'V' command (BCD): 1.29, from October
+// 2025
+#define SDC_VERSION (0x0129)
 
 #define SDC_SECTORS_PER_TRACK (18)
 
