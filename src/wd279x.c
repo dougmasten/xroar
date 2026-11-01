@@ -243,6 +243,7 @@ static void wd279x_free(struct part *p) {
 	log_close(&fdc->log_rsec_hex);
 	log_close(&fdc->log_wsec_hex);
 	log_close(&fdc->log_wtrk_hex);
+	log_close(&fdc->log_rtrk_hex);
 	event_dequeue(&fdc->state_event);
 }
 
@@ -943,9 +944,9 @@ static void wd279x_state_machine(void *sptr) {
 				NEXT_STATE(fdc, WD279X_state_read_address_1, DELEGATE_CALL(fdc->time_to_next_idam));
 				return;
 			case 0xe0:
-				LOG_MOD_WARN("wd279x", "CMD: read track not implemented\n");
-				SET_INTRQ(fdc);
-				break;
+				fdc->index_holes_count = 0;
+				NEXT_STATE(fdc, WD279X_state_read_track_1, DELEGATE_CALL(fdc->time_to_next_idam));
+				return;
 			case 0xf0:
 				SET_STATE(fdc, WD279X_state_write_track_1);
 				continue;
@@ -1004,6 +1005,43 @@ static void wd279x_state_machine(void *sptr) {
 			}
 			fdc->status_register &= ~(STATUS_BUSY);
 			SET_INTRQ(fdc);
+			return;
+
+
+		case WD279X_state_read_track_1:
+			// Wait for the index pulse
+			if (fdc->index_holes_count == 0) {
+				NEXT_STATE(fdc, WD279X_state_read_track_1, DELEGATE_CALL(fdc->time_to_next_idam));
+				return;
+			}
+			fdc->index_holes_count = 0;
+			if (logging.debug_fdc & LOG_FDC_DATA)
+				log_open_hexdump(&fdc->log_rtrk_hex, "[wd279x] rd-track");
+			SET_STATE(fdc, WD279X_state_read_track_2);
+			continue;
+
+
+		case WD279X_state_read_track_2:
+			// Every byte up to the next index pulse.  Track data is
+			// stored byte aligned, so there's no need to model the
+			// resync at address marks.
+			if (fdc->index_holes_count > 0) {
+				if (logging.debug_fdc & LOG_FDC_DATA)
+					log_close(&fdc->log_rtrk_hex);
+				fdc->status_register &= ~(STATUS_BUSY);
+				SET_INTRQ(fdc);
+				return;
+			}
+			if (fdc->status_register & STATUS_DRQ) {
+				fdc->status_register |= STATUS_LOST_DATA;
+				if (logging.debug_fdc & LOG_FDC_DATA)
+					log_hexdump_flag(fdc->log_rtrk_hex);
+			}
+			fdc->data_register = wd279x_read_byte(fdc);
+			if (logging.debug_fdc & LOG_FDC_DATA)
+				log_hexdump_byte(fdc->log_rtrk_hex, fdc->data_register);
+			SET_DRQ(fdc);
+			NEXT_STATE(fdc, WD279X_state_read_track_2, DELEGATE_CALL(fdc->time_to_next_byte));
 			return;
 
 
@@ -1155,6 +1193,8 @@ static char const * const debug_state_name[] = {
 	"write_track_2",
 	"write_track_2b",
 	"write_track_3",
+	"read_track_1",
+	"read_track_2",
 };
 
 static char const * const debug_command[] = {
@@ -1172,7 +1212,7 @@ static char const * const debug_command[] = {
 	"write-sector",
 	"read-address",
 	"force-interrupt",
-	"read-track N/A",
+	"read-track",
 	"write-track",
 };
 

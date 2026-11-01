@@ -56,6 +56,8 @@ enum WD279X_state {
 	WD279X_state_write_track_2,
 	WD279X_state_write_track_2b,
 	WD279X_state_write_track_3,
+	WD279X_state_read_track_1,
+	WD279X_state_read_track_2,
 	WD279X_state_invalid
 };
 
@@ -125,6 +127,7 @@ struct WD279X {
 	struct log_handle *log_rsec_hex;
 	struct log_handle *log_wsec_hex;
 	struct log_handle *log_wtrk_hex;
+	struct log_handle *log_rtrk_hex;
 };
 
 // Reported to the UI (ui_tag_fdc_status) so it can show a disk activity
