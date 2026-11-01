@@ -967,10 +967,45 @@ static void unmount(struct cocosdc *d, unsigned drive) {
 		xroar_eject_disk(drive);
 }
 
+// Fill a newly created disk image.  $FF4A gives the number of sides: zero
+// makes a blank 35 track single sided DSK (630 sectors), one or two an SDF
+// with the number of tracks in $FF49 and no sectors, ready to be formatted.
+
+static uint8_t new_image(struct cocosdc *d, FILE *f) {
+	unsigned sides = d->param[1];
+	unsigned tracks = d->param[0];
+	if (sides == 0) {
+		uint8_t blank[256];
+		memset(blank, 0xff, sizeof(blank));
+		for (unsigned i = 0; i < 35 * SDC_SECTORS_PER_TRACK; i++)
+			fwrite(blank, 1, sizeof(blank), f);
+		// Every block of the image: that takes the real controller
+		// most of a second
+		d->delay += (35 * SDC_SECTORS_PER_TRACK / 2) * T_SD_WRITE;
+		return 0;
+	}
+	// The firmware also accepts zero tracks, with odd results
+	if (sides > 2 || tracks < 1 || tracks > 240)
+		return STA_FAILED | STA_CRC;
+	// The header, then a record for each track with an empty sector
+	// table.  The real controller only writes the table and the last
+	// block of each record, leaving whatever the card held in between.
+	uint8_t rec[6656];
+	memset(rec, 0, sizeof(rec));
+	memcpy(rec, "SDF1", 4);
+	rec[4] = tracks;
+	rec[5] = sides;
+	fwrite(rec, 1, 512, f);
+	memset(rec, 0, 8);
+	for (unsigned i = 0; i < tracks * sides; i++)
+		fwrite(rec, 1, sizeof(rec), f);
+	d->delay += (2 * tracks * sides + 1) * T_SD_WRITE;
+	return 0;
+}
+
 // Mount a file: as a disk image through the floppy drives, or as raw blocks
 // (raw files can't be accessed through FDC emulation).  If create is set,
-// the file is created first if it doesn't exist; a new disk image is a blank
-// 35 track single sided DSK (630 sectors).
+// the file is created first if it doesn't exist (see new_image()).
 
 static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, bool raw, bool create) {
 	if (!*path) {
@@ -992,17 +1027,15 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 			sdsfree(host);
 			return STA_FAILED | STA_INVALID;
 		}
-		// The new directory entry, then every block of a disk image:
-		// that takes the real controller most of a second
+		// The new directory entry
 		d->delay += T_SD_WRITE;
-		if (!raw) {
-			uint8_t blank[256];
-			memset(blank, 0xff, sizeof(blank));
-			for (unsigned i = 0; i < 35 * SDC_SECTORS_PER_TRACK; i++)
-				fwrite(blank, 1, sizeof(blank), f);
-			d->delay += (35 * SDC_SECTORS_PER_TRACK / 2) * T_SD_WRITE;
-		}
+		uint8_t r = raw ? 0 : new_image(d, f);
 		fclose(f);
+		if (r) {
+			// Like the real controller, this leaves the empty file
+			sdsfree(host);
+			return r;
+		}
 	} else if (S_ISDIR(st.st_mode)) {
 		sdsfree(host);
 		return STA_FAILED | STA_NOTFOUND;
@@ -1138,10 +1171,6 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 	case 'M': case 'm':
 		return mount_file(d, drive, arg, d->buf[0] == 'm', 0);
 	case 'N': case 'n':
-		// Creating SDF images (cylinders and sides in the parameters)
-		// isn't supported
-		if (d->buf[0] == 'N' && (d->param[0] || d->param[1]))
-			return STA_FAILED | STA_INVALID;
 		return mount_file(d, drive, arg, d->buf[0] == 'n', 1);
 	case 'D':
 		return set_dir(d, arg);
