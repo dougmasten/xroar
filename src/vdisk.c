@@ -159,18 +159,39 @@ void vdisk_unref(struct vdisk *disk) {
 // it as dirty, they should clear the dirty flag before returning, but it's
 // done here anyway.
 
+// If the extension doesn't name a disk image type, identify it by content
+// instead, like the CoCo SDC does: an SDF or VDK header, otherwise a JVC
+// image (a plain sector dump, maybe with a short header).
+
+static enum xroar_filetype vdisk_filetype_by_content(const char *filename) {
+	uint8_t h[4] = {0};
+	FILE *fd = fopen(filename, "rb");
+	if (fd) {
+		if (fread(h, 1, sizeof(h), fd) < 1)
+			h[0] = 0;
+		fclose(fd);
+	}
+	if (memcmp(h, "SDF1", 4) == 0)
+		return FILETYPE_SDF;
+	if (h[0] == 'd' && h[1] == 'k')
+		return FILETYPE_VDK;
+	return FILETYPE_JVC;
+}
+
 struct vdisk *vdisk_load(const char *filename) {
 	if (filename == NULL) return NULL;
 	enum xroar_filetype filetype = xroar_filetype_by_ext(filename);
-	for (unsigned i = 0; i < ARRAY_N_ELEMENTS(dispatch); i++) {
-		if (dispatch[i].filetype == filetype) {
-			struct vdisk *d = dispatch[i].load_func(filename);
-			if (d)
-				d->dirty = 0;
-			return d;
+	for (unsigned pass = 0; pass < 2; pass++) {
+		for (unsigned i = 0; i < ARRAY_N_ELEMENTS(dispatch); i++) {
+			if (dispatch[i].filetype == filetype) {
+				struct vdisk *d = dispatch[i].load_func(filename);
+				if (d)
+					d->dirty = 0;
+				return d;
+			}
 		}
+		filetype = vdisk_filetype_by_content(filename);
 	}
-	LOG_MOD_WARN("vdisk", "%s: no virtual disk reader for file type\n", filename);
 	return NULL;
 }
 
