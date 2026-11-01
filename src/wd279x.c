@@ -769,6 +769,9 @@ static void wd279x_state_machine(void *sptr) {
 					bytes_to_scan = 43;
 				j = 0;
 				fdc->dam = 0;
+				// In double density, a data mark is only
+				// recognised after $A1 sync bytes.
+				int prev = 0;
 				do {
 					fdc->crc = CRC16_CCITT_RESET;
 					if (IS_DOUBLE_DENSITY(fdc)) {
@@ -777,8 +780,10 @@ static void wd279x_state_machine(void *sptr) {
 						fdc->crc = crc16_ccitt_byte(fdc->crc, 0xa1);
 					}
 					int tmp = wd279x_read_byte(fdc);
-					if (tmp == 0xfb || tmp == 0xf8)
+					if (tmp >= 0xf8 && tmp <= 0xfb
+					    && (IS_SINGLE_DENSITY(fdc) || prev == 0xa1))
 						fdc->dam = tmp;
+					prev = tmp;
 					j++;
 				} while (j < bytes_to_scan && fdc->dam == 0);
 				if (fdc->dam == 0) {
