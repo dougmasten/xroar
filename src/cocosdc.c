@@ -100,6 +100,7 @@
 #define STA_CRC      (0x08)
 #define STA_NOTFOUND (0x10)
 #define STA_INUSE    (0x20)
+#define STA_WPROT    (0x40)
 #define STA_FAILED   (0x80)
 
 // Firmware version reported by the 'V' command (BCD)
@@ -781,6 +782,9 @@ static void fat_record(uint8_t *rec, const char *host) {
 		if (S_ISDIR(st.st_mode)) {
 			rec[11] = 0x10;
 		} else {
+			// A file the host won't let us write is read-only
+			if (!(st.st_mode & S_IWUSR))
+				rec[11] = 0x01;
 			uint32_t size = st.st_size;
 			rec[28] = size;
 			rec[29] = size >> 8;
@@ -1005,8 +1009,9 @@ static uint8_t raw_read(struct cocosdc *d, unsigned drive, unsigned lsn) {
 
 static uint8_t raw_write(struct cocosdc *d, unsigned drive, unsigned lsn) {
 	FILE *f = d->drv[drive].raw;
+	// The firmware fails writing a read-only file with $04
 	if (d->drv[drive].raw_ro)
-		return STA_FAILED | STA_INUSE;
+		return STA_FAILED | STA_INVALID;
 	if (fseeko(f, (off_t)lsn * 256, SEEK_SET) != 0 || fwrite(d->buf, 1, 256, f) != 256)
 		return STA_FAILED | STA_NOTFOUND;
 	fflush(f);
@@ -1037,7 +1042,10 @@ static uint8_t write_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool s
 	if (!disk)
 		return STA_FAILED | STA_NOTFOUND;
 	if (disk->write_protect)
-		return STA_FAILED | STA_INUSE;
+		return STA_FAILED | STA_WPROT;
+	struct stat st;
+	if (stat(disk->filename, &st) == 0 && !(st.st_mode & S_IWUSR))
+		return STA_FAILED | STA_INVALID;
 	unsigned cyl, head, sector;
 	if (!lsn_chs(disk, lsn, ss, &cyl, &head, &sector))
 		return STA_FAILED | STA_NOTFOUND;
@@ -1673,6 +1681,13 @@ static void command(struct cocosdc *d, uint8_t cmd) {
 		break;
 	case 0xa0:
 	case 0xe0:
+		if ((cmd & 0xf0) == 0xa0 && drive_disk(d, drive) && drive_disk(d, drive)->write_protect) {
+			// A write protected image refuses the command before
+			// the block is sent
+			d->status = STA_FAILED | STA_WPROT;
+			d->delay = T_ACCEPT;
+			break;
+		}
 		d->byte_mode = (cmd & 0xf0) == 0xa0 && (cmd & 8);
 		d->buf_pos = 0;
 		d->buf_count = 256;
