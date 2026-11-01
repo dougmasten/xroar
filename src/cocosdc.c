@@ -100,6 +100,7 @@
 
 #define SDC_BANK_SIZE (0x4000)
 #define SDC_NBANKS (8)
+#define FLASH_SIZE (SDC_NBANKS * SDC_BANK_SIZE)
 
 // Status register bits
 #define STA_BUSY     (0x01)
@@ -213,12 +214,23 @@ struct cocosdc {
 
 	// Streaming ($90/$91): 512 byte blocks of a mounted file
 	FILE *stream;
+	sds stream_path;  // to reopen it after restoring a snapshot...
+	uint32_t stream_offset;  // ...at this position
 	uint8_t sbuf[512];
 	unsigned spos;
 	struct sdc_dirent *listing;
 	unsigned listing_n;
 	unsigned listing_pos;
+
+	uint8_t *flash_restore;  // flash contents from a snapshot
 };
+
+#define COCOSDC_SER_PARAM         (20)
+#define COCOSDC_SER_BUF           (21)
+#define COCOSDC_SER_STREAM_OFFSET (37)
+#define COCOSDC_SER_SBUF          (38)
+#define COCOSDC_SER_LISTING       (40)
+#define COCOSDC_SER_FLASH         (52)
 
 static const struct ser_struct ser_struct_cocosdc[] = {
 	SER_ID_STRUCT_NEST(1, &cart_ser_struct_data),
@@ -237,11 +249,52 @@ static const struct ser_struct ser_struct_cocosdc[] = {
 	SER_ID_STRUCT_ELEM(14, struct cocosdc, ready_count),
 	SER_ID_STRUCT_ELEM(15, struct cocosdc, sd_block),
 	SER_ID_STRUCT_ELEM(16, struct cocosdc, sd_dirty),
+	SER_ID_STRUCT_ELEM(17, struct cocosdc, latch_old),
+	SER_ID_STRUCT_ELEM(18, struct cocosdc, cmd),
+	SER_ID_STRUCT_ELEM(19, struct cocosdc, block_status),
+	SER_ID_STRUCT_UNHANDLED(COCOSDC_SER_PARAM),
+	SER_ID_STRUCT_UNHANDLED(COCOSDC_SER_BUF),
+	SER_ID_STRUCT_ELEM(22, struct cocosdc, buf_pos),
+	SER_ID_STRUCT_ELEM(23, struct cocosdc, buf_count),
+	SER_ID_STRUCT_ELEM(24, struct cocosdc, buf_rx),
+	SER_ID_STRUCT_ELEM(25, struct cocosdc, byte_mode),
+	SER_ID_STRUCT_TYPE(26, ser_type_string, struct cocosdc, sd_root),
+	SER_ID_STRUCT_TYPE(27, ser_type_sds, struct cocosdc, cur_dir),
+	SER_ID_STRUCT_TYPE(28, ser_type_sds, struct cocosdc, drv[0].path),
+	SER_ID_STRUCT_ELEM(29, struct cocosdc, drv[0].raw_ro),
+	SER_ID_STRUCT_ELEM(30, struct cocosdc, drv[0].written),
+	SER_ID_STRUCT_TYPE(31, ser_type_sds, struct cocosdc, drv[1].path),
+	SER_ID_STRUCT_ELEM(32, struct cocosdc, drv[1].raw_ro),
+	SER_ID_STRUCT_ELEM(33, struct cocosdc, drv[1].written),
+	SER_ID_STRUCT_TYPE(34, ser_type_sds, struct cocosdc, set_dir),
+	SER_ID_STRUCT_ELEM(35, struct cocosdc, set_num),
+	SER_ID_STRUCT_TYPE(36, ser_type_sds, struct cocosdc, stream_path),
+	SER_ID_STRUCT_UNHANDLED(COCOSDC_SER_STREAM_OFFSET),
+	SER_ID_STRUCT_UNHANDLED(COCOSDC_SER_SBUF),
+	SER_ID_STRUCT_ELEM(39, struct cocosdc, spos),
+	SER_ID_STRUCT_UNHANDLED(COCOSDC_SER_LISTING),
+	SER_ID_STRUCT_ELEM(41, struct cocosdc, listing_pos),
+	SER_ID_STRUCT_TYPE(42, ser_type_string, struct cocosdc, flash_file),
+	SER_ID_STRUCT_ELEM(43, struct cocosdc, flash_enable),
+	SER_ID_STRUCT_ELEM(44, struct cocosdc, flash_armed),
+	SER_ID_STRUCT_ELEM(45, struct cocosdc, flash_state),
+	SER_ID_STRUCT_ELEM(46, struct cocosdc, flash_id),
+	SER_ID_STRUCT_ELEM(47, struct cocosdc, flash_busy),
+	SER_ID_STRUCT_TYPE(48, ser_type_tick, struct cocosdc, flash_busy_until),
+	SER_ID_STRUCT_ELEM(49, struct cocosdc, flash_status),
+	SER_ID_STRUCT_ELEM(50, struct cocosdc, flash_toggle),
+	SER_ID_STRUCT_ELEM(51, struct cocosdc, flash_modified),
+	SER_ID_STRUCT_UNHANDLED(COCOSDC_SER_FLASH),
 };
+
+static bool cocosdc_read_elem(void *sptr, struct ser_handle *sh, int tag);
+static bool cocosdc_write_elem(void *sptr, struct ser_handle *sh, int tag);
 
 static const struct ser_struct_data cocosdc_ser_struct_data = {
 	.elems = ser_struct_cocosdc,
 	.num_elems = ARRAY_N_ELEMENTS(ser_struct_cocosdc),
+	.read_elem = cocosdc_read_elem,
+	.write_elem = cocosdc_write_elem,
 };
 
 static struct xconfig_option const cocosdc_options[] = {
@@ -276,6 +329,103 @@ static void ready_done(void *sptr);
 
 static void cocosdc_ui_set_hd_filename(void *sptr, int tag, void *smsg);
 static void flash_save(struct cocosdc *d);
+static uint8_t *flash_byte(struct cocosdc *d, unsigned a);
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+// Snapshots: buffers, the stream's position, the directory listing and any
+// flash programming
+
+static bool cocosdc_read_elem(void *sptr, struct ser_handle *sh, int tag) {
+	struct cocosdc *d = sptr;
+	switch (tag) {
+	case COCOSDC_SER_PARAM:
+		ser_read(sh, d->param, sizeof(d->param));
+		break;
+	case COCOSDC_SER_BUF:
+		ser_read(sh, d->buf, sizeof(d->buf));
+		break;
+	case COCOSDC_SER_STREAM_OFFSET:
+		d->stream_offset = ser_read_vuint32(sh);
+		break;
+	case COCOSDC_SER_SBUF:
+		ser_read(sh, d->sbuf, sizeof(d->sbuf));
+		break;
+	case COCOSDC_SER_LISTING: {
+		unsigned n = ser_data_length(sh) / 16;
+		free(d->listing);
+		d->listing = n ? xmalloc(n * sizeof(*d->listing)) : NULL;
+		d->listing_n = n;
+		for (unsigned i = 0; i < n; i++) {
+			uint8_t rec[16];
+			ser_read(sh, rec, sizeof(rec));
+			memcpy(d->listing[i].name, rec, 8);
+			memcpy(d->listing[i].ext, rec + 8, 3);
+			d->listing[i].attr = rec[11];
+			d->listing[i].size = (rec[12] << 24) | (rec[13] << 16) | (rec[14] << 8) | rec[15];
+		}
+		break;
+	}
+	case COCOSDC_SER_FLASH:
+		free(d->flash_restore);
+		d->flash_restore = xmalloc(FLASH_SIZE);
+		ser_read(sh, d->flash_restore, FLASH_SIZE);
+		break;
+	default:
+		return 0;
+	}
+	return 1;
+}
+
+static bool cocosdc_write_elem(void *sptr, struct ser_handle *sh, int tag) {
+	struct cocosdc *d = sptr;
+	switch (tag) {
+	case COCOSDC_SER_PARAM:
+		ser_write(sh, tag, d->param, sizeof(d->param));
+		break;
+	case COCOSDC_SER_BUF:
+		ser_write(sh, tag, d->buf, sizeof(d->buf));
+		break;
+	case COCOSDC_SER_STREAM_OFFSET:
+		if (d->stream)
+			ser_write_vuint32(sh, tag, ftello(d->stream));
+		break;
+	case COCOSDC_SER_SBUF:
+		if (d->stream)
+			ser_write(sh, tag, d->sbuf, sizeof(d->sbuf));
+		break;
+	case COCOSDC_SER_LISTING:
+		if (d->listing_n) {
+			ser_write_tag(sh, tag, d->listing_n * 16);
+			for (unsigned i = 0; i < d->listing_n; i++) {
+				const struct sdc_dirent *e = &d->listing[i];
+				uint8_t rec[16];
+				memcpy(rec, e->name, 8);
+				memcpy(rec + 8, e->ext, 3);
+				rec[11] = e->attr;
+				rec[12] = e->size >> 24;
+				rec[13] = e->size >> 16;
+				rec[14] = e->size >> 8;
+				rec[15] = e->size;
+				ser_write_untagged(sh, rec, sizeof(rec));
+			}
+			ser_write_close_tag(sh);
+		}
+		break;
+	case COCOSDC_SER_FLASH:
+		// The contents only differ from the ROM images if programmed
+		if (d->flash_modified) {
+			ser_write_tag(sh, tag, FLASH_SIZE);
+			for (unsigned a = 0; a < FLASH_SIZE; a += SDC_BANK_SIZE)
+				ser_write_untagged(sh, flash_byte(d, a), SDC_BANK_SIZE);
+			ser_write_close_tag(sh);
+		}
+		break;
+	default:
+		return 0;
+	}
+	return 1;
+}
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -375,7 +525,32 @@ static bool cocosdc_finish(struct part *p) {
 		event_queue(&d->ready_event);
 	}
 
-	d->cur_dir = sdsempty();
+	// After restoring a snapshot, reopen files and put back any flash
+	// programming
+	if (!d->cur_dir)
+		d->cur_dir = sdsempty();
+	for (unsigned i = 0; i < 2; i++) {
+		if (!d->drv[i].path)
+			continue;
+		d->drv[i].raw = fopen(d->drv[i].path, d->drv[i].raw_ro ? "rb" : "r+b");
+		if (!d->drv[i].raw) {
+			LOG_MOD_WARN("cocosdc", "%s: %s\n", d->drv[i].path, strerror(errno));
+			sdsfree(d->drv[i].path);
+			d->drv[i].path = NULL;
+		}
+	}
+	if (d->stream_path) {
+		d->stream = fopen(d->stream_path, "rb");
+		if (!d->stream || fseeko(d->stream, d->stream_offset, SEEK_SET) != 0)
+			stop_stream(d);
+	}
+	if (d->flash_restore) {
+		for (unsigned a = 0; a < FLASH_SIZE; a += SDC_BANK_SIZE)
+			memcpy(flash_byte(d, a), d->flash_restore + a, SDC_BANK_SIZE);
+		free(d->flash_restore);
+		d->flash_restore = NULL;
+	}
+
 	d->msgr_client_id = messenger_client_register();
 	ui_messenger_join_group(d->msgr_client_id, ui_tag_hd_filename, MESSENGER_NOTIFY_DELEGATE(cocosdc_ui_set_hd_filename, d));
 
@@ -396,8 +571,8 @@ static void cocosdc_free(struct part *p) {
 			fclose(d->drv[i].raw);
 	}
 	sdsfree(d->set_dir);
-	if (d->stream)
-		fclose(d->stream);
+	stop_stream(d);
+	free(d->flash_restore);
 	free(d->listing);
 	cart_rom_free(p);
 }
@@ -469,7 +644,6 @@ static void cocosdc_detach(struct cart *c) {
 
 // Flash: an SST39SF010A, 128K in 4K sectors
 
-#define FLASH_SIZE   (SDC_NBANKS * SDC_BANK_SIZE)
 #define FLASH_SECTOR (0x1000)
 #define T_FLASH_PROGRAM EVENT_US(20)
 #define T_FLASH_SECTOR  EVENT_MS(25)
@@ -1818,6 +1992,8 @@ static void stop_stream(struct cocosdc *d) {
 		fclose(d->stream);
 		d->stream = NULL;
 	}
+	sdsfree(d->stream_path);
+	d->stream_path = NULL;
 }
 
 static bool next_stream_block(struct cocosdc *d) {
@@ -1843,6 +2019,7 @@ static void start_stream(struct cocosdc *d, unsigned drive, unsigned block, bool
 		return;
 	}
 	d->stream = f;
+	d->stream_path = sdsnew(path);
 	d->byte_mode = byte_mode;
 	// Streaming uses the MCU's buffer
 	sd_flush(d);
