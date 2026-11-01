@@ -52,17 +52,19 @@
  * a value written to $FF42 is then written to the flash by the next read of
  * the ROM area, at that address.  That's how the JEDEC command sequences
  * (with their $5555/$2AAA addresses spanning banks 0 and 1) reach the chip.
- * Programmed contents survive resets.  With "-cart-opt flash=FILE" they're
+ * Programmed contents survive resets.  With "-cart-opt sdc-flash=FILE" they're
  * kept in a 128K image file: if it exists, it's loaded instead of the default
  * banks, and it's rewritten on exit if the flash was changed.
  *
  * Commands take time, as on the real controller: BUSY stays set until a
  * command completes, and READY is only set once a block can be transferred.
- * The delays were measured on real hardware.  The MCU reads and writes the SD
- * card through a single 512 byte buffer, so a logical sector in the same SD
- * block as the last one is quick, and a modified block is written back when
- * another is needed.  How long the card itself takes varies a lot from card
- * to card; the times used here are typical.
+ * The delays were measured on real hardware, with a Toshiba FlashAir card.
+ * The MCU reads and writes the SD card through a single 512 byte buffer, so
+ * a logical sector in the same SD block as the last one is quick, and a
+ * modified block is written back when another is needed.  How long the card
+ * itself takes varies a lot from card to card; the times used here are
+ * typical.  "-cart-opt sdc-card=instant" makes SD card access take no time,
+ * leaving only the controller's own ("sdc-card=normal" is the default).
  */
 
 #include "top-config.h"
@@ -131,9 +133,10 @@
 #define T_SCAN    EVENT_US(680)   // look for a disk in the set's directory
 #define T_BLINK   EVENT_MS(380)   // blink the LED once (38 x 10ms delays)
 
-// These depend on the SD card: typical values.
-#define T_SD_READ  EVENT_US(1300)  // read a 512 byte block
-#define T_SD_WRITE EVENT_US(3000)  // write a 512 byte block
+// These depend on the SD card, set by the "sdc-card" option (by default, as
+// measured on a FlashAir).
+#define T_SD_READ  (d->t_sd_read)  // read a 512 byte block
+#define T_SD_WRITE (d->t_sd_write)  // write a 512 byte block
 #define T_DIR      (4 * T_SD_READ)  // find a file
 #define T_DIRPAGE  (3 * T_SD_READ)  // a page of directory listing
 
@@ -176,6 +179,11 @@ struct cocosdc {
 	bool flash_toggle;  // bit 6 read while busy
 	bool flash_modified;
 	char *flash_file;
+
+	// SD card speed: "normal" (as measured) or "instant"
+	char *card;
+	event_ticks t_sd_read;
+	event_ticks t_sd_write;
 
 	// Command mode
 	bool cmd_mode;
@@ -285,6 +293,8 @@ static const struct ser_struct ser_struct_cocosdc[] = {
 	SER_ID_STRUCT_ELEM(50, struct cocosdc, flash_toggle),
 	SER_ID_STRUCT_ELEM(51, struct cocosdc, flash_modified),
 	SER_ID_STRUCT_UNHANDLED(COCOSDC_SER_FLASH),
+	SER_ID_STRUCT_ELEM(53, struct cocosdc, t_sd_read),
+	SER_ID_STRUCT_ELEM(54, struct cocosdc, t_sd_write),
 };
 
 static bool cocosdc_read_elem(void *sptr, struct ser_handle *sh, int tag);
@@ -298,7 +308,8 @@ static const struct ser_struct_data cocosdc_ser_struct_data = {
 };
 
 static struct xconfig_option const cocosdc_options[] = {
-	{ XCO_SET_STRING("flash", struct cocosdc, flash_file) },
+	{ XCO_SET_STRING("sdc-flash", struct cocosdc, flash_file) },
+	{ XCO_SET_STRING("sdc-card", struct cocosdc, card) },
 };
 
 static const struct xconfig_set cocosdc_option_set = {
@@ -466,6 +477,8 @@ static struct part *cocosdc_allocate(void) {
 	c->attach_interface = cocosdc_attach_interface;
 
 	event_init(&d->ready_event, MACHINE_EVENT_LIST, DELEGATE_AS0(void, ready_done, d));
+	d->t_sd_read = EVENT_US(1300);
+	d->t_sd_write = EVENT_US(3000);
 	d->sd_block = SD_BLOCK_NONE;
 
 	return p;
@@ -480,6 +493,12 @@ static void cocosdc_initialise(struct part *p, void *options) {
 
 	struct cocosdc *d = (struct cocosdc *)p;
 	xconfig_parse_list_struct(&cocosdc_option_set, cc->opts, d);
+	// "instant" leaves the MCU's own timing, but makes card access free
+	if (d->card && strcmp(d->card, "instant") == 0) {
+		d->t_sd_read = d->t_sd_write = 0;
+	} else if (d->card && strcmp(d->card, "normal") != 0) {
+		LOG_MOD_WARN("cocosdc", "unknown sdc-card '%s'\n", d->card);
+	}
 }
 
 // Load a ROM image into a flash bank, unless the bank already holds one.
@@ -561,6 +580,7 @@ static void cocosdc_free(struct part *p) {
 	struct cocosdc *d = (struct cocosdc *)p;
 	flash_save(d);
 	free(d->flash_file);
+	free(d->card);
 	event_dequeue(&d->ready_event);
 	messenger_client_unregister(d->msgr_client_id);
 	free(d->sd_root);
