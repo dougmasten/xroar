@@ -47,9 +47,11 @@ static struct vdisk *vdisk_load_vdk(const char *filename);
 static struct vdisk *vdisk_load_jvc(const char *filename);
 static struct vdisk *vdisk_load_os9(const char *filename);
 static struct vdisk *vdisk_load_dmk(const char *filename);
+static struct vdisk *vdisk_load_sdf(const char *filename);
 static int vdisk_save_vdk(struct vdisk *disk);
 static int vdisk_save_jvc(struct vdisk *disk);
 static int vdisk_save_dmk(struct vdisk *disk);
+static int vdisk_save_sdf(struct vdisk *disk);
 
 static struct {
 	enum xroar_filetype filetype;
@@ -60,6 +62,7 @@ static struct {
 	{ FILETYPE_JVC, vdisk_load_jvc, vdisk_save_jvc },
 	{ FILETYPE_OS9, vdisk_load_os9, vdisk_save_jvc },
 	{ FILETYPE_DMK, vdisk_load_dmk, vdisk_save_dmk },
+	{ FILETYPE_SDF, vdisk_load_sdf, vdisk_save_sdf },
 };
 
 // Configured interleave for single and double density
@@ -814,6 +817,166 @@ static int vdisk_save_dmk(struct vdisk *disk) {
 				fs_write_uint16_le(fd, idams[i]);
 			}
 			fwrite(buf, disk->track_length - 128, 1, fd);
+		}
+	}
+	fclose(fd);
+	disk->dirty = 0;
+	return 0;
+}
+
+/* SDF is the CoCo SDC's format for disks that a plain sector dump can't
+ * represent, like copy protected ones.  Like DMK, it holds raw track data.  A
+ * 512-byte header is followed by a 6656-byte record for each track (all the
+ * sides of cylinder 0, then cylinder 1, etc.):
+ *
+ * - [0..3]       "SDF1"
+ * - [4]          Number of cylinders
+ * - [5]          Number of sides
+ * - [6]          Write protect ($00 = write enable, otherwise write protect)
+ *
+ * The rest of the header is zero.  Each track record is a 256-byte sector
+ * table, then 6400 bytes of double density track data without clocking.  The
+ * table holds the number of sectors, 7 zero bytes, then 8 bytes for each
+ * sector:
+ *
+ * - [0..1]       Offset of the ID field, just after its $FE mark
+ * - [2..3]       Offset of the data field, just after its mark (0 if none)
+ * - [4..7]       The ID field: cylinder, head, sector and size code
+ *
+ * Offsets are little-endian, relative to the start of the record.  Bit 15 of
+ * each flags a bad CRC, computed over the three bytes stored before the mark
+ * (normally the $A1 syncs) and the field.  The flags are derived from the
+ * track data, so they're ignored when reading and recomputed when writing.
+ * Single density isn't supported.
+ */
+
+#define SDF_TRACK_SIZE (6656)
+#define SDF_TABLE_SIZE (256)
+#define SDF_TRACK_LENGTH (SDF_TRACK_SIZE - SDF_TABLE_SIZE + 128)
+#define SDF_CRC_ERROR (0x8000)
+
+// Check the CRC of a field (ID or data) starting with its mark, including the
+// three bytes before it.
+
+static bool sdf_crc_ok(const uint8_t *field, unsigned length) {
+	uint16_t crc = crc16_ccitt_block(CRC16_CCITT_RESET, field - 3, length + 3);
+	return field[length] == (crc >> 8) && field[length + 1] == (crc & 0xff);
+}
+
+static struct vdisk *vdisk_load_sdf(const char *filename) {
+	FILE *fd = fopen(filename, "rb");
+	if (!fd)
+		return NULL;
+	uint8_t header[512];
+	if (fread(header, sizeof(header), 1, fd) < 1 || memcmp(header, "SDF1", 4) != 0) {
+		LOG_MOD_SUB_WARN("vdisk", "sdf", "%s: not an SDF image\n", filename);
+		fclose(fd);
+		return NULL;
+	}
+	unsigned ncyls = header[4];
+	unsigned nheads = header[5];
+	if (ncyls < 1 || nheads < 1 || nheads > MAX_HEADS) {
+		LOG_MOD_SUB_WARN("vdisk", "sdf", "%s: bad geometry %uC %uH\n", filename, ncyls, nheads);
+		fclose(fd);
+		return NULL;
+	}
+	LOG_MOD_SUB_DEBUG(1, "vdisk", "sdf", "%s: reading: %uC %uH\n", filename, ncyls, nheads);
+
+	struct vdisk *disk = vdisk_new(SDF_TRACK_LENGTH);
+	disk->filetype = FILETYPE_SDF;
+	disk->filename = xstrdup(filename);
+	disk->write_protect = header[6] ? 1 : 0;
+
+	uint8_t rec[SDF_TRACK_SIZE];
+	for (unsigned cyl = 0; cyl < ncyls; cyl++) {
+		for (unsigned head = 0; head < nheads; head++) {
+			uint16_t *idams = vdisk_extend_disk(disk, cyl, head);
+			if (!idams) {
+				fclose(fd);
+				vdisk_unref(disk);
+				return NULL;
+			}
+			uint8_t *buf = (uint8_t *)idams + 128;
+			if (fread(rec, sizeof(rec), 1, fd) < 1) {
+				LOG_MOD_SUB_WARN("vdisk", "sdf", "%s: short read at cylinder %u\n", filename, cyl);
+				memset(rec, 0, sizeof(rec));
+			}
+			// In memory, track data follows a 128 byte IDAM table, so
+			// SDF offsets less SDF_TABLE_SIZE-128 index the track
+			const int adj = SDF_TABLE_SIZE - 128;
+			memcpy(buf, rec + SDF_TABLE_SIZE, SDF_TRACK_SIZE - SDF_TABLE_SIZE);
+			unsigned nsectors = rec[0];
+			if (nsectors > (SDF_TABLE_SIZE - 8) / 8)
+				nsectors = (SDF_TABLE_SIZE - 8) / 8;
+			unsigned n = 0;
+			for (unsigned i = 0; i < nsectors; i++) {
+				const uint8_t *e = rec + 8 + i * 8;
+				unsigned id_off = (e[0] | (e[1] << 8));
+				int id = (int)(id_off & 0x3fff) - adj - 1;  // the $FE mark
+				if (id < 128 || id + 7 > SDF_TRACK_LENGTH)
+					continue;
+				idams[n++] = id | VDISK_DOUBLE_DENSITY;
+			}
+		}
+	}
+	fclose(fd);
+	disk->dirty = 0;
+	return disk;
+}
+
+static int vdisk_save_sdf(struct vdisk *disk) {
+	if (!disk)
+		return -1;
+	FILE *fd = fopen(disk->filename, "wb");
+	if (!fd)
+		return -1;
+	LOG_MOD_SUB_DEBUG(1, "vdisk", "sdf", "%s: writing: %uC %uH\n", disk->filename, disk->num_cylinders, disk->num_heads);
+	uint8_t header[512];
+	memset(header, 0, sizeof(header));
+	memcpy(header, "SDF1", 4);
+	header[4] = disk->num_cylinders;
+	header[5] = disk->num_heads;
+	header[6] = disk->write_protect ? 0xff : 0;
+	fwrite(header, sizeof(header), 1, fd);
+
+	const int adj = SDF_TABLE_SIZE - 128;
+	unsigned tlen = disk->track_length;
+	if (tlen > SDF_TRACK_LENGTH)
+		tlen = SDF_TRACK_LENGTH;
+	uint8_t rec[SDF_TRACK_SIZE];
+	for (unsigned cyl = 0; cyl < disk->num_cylinders; cyl++) {
+		for (unsigned head = 0; head < disk->num_heads; head++) {
+			memset(rec, 0, sizeof(rec));
+			uint16_t *idams = vdisk_track_base(disk, cyl, head);
+			if (idams) {
+				uint8_t *track = (uint8_t *)idams;
+				memcpy(rec + SDF_TABLE_SIZE, track + 128, tlen - 128);
+				unsigned n = 0;
+				for (unsigned i = 0; i < 64 && n < (SDF_TABLE_SIZE - 8) / 8; i++) {
+					unsigned id = idams[i] & 0x3fff;
+					if (!(idams[i] & VDISK_DOUBLE_DENSITY) || id < 131 || id + 7 > tlen)
+						continue;
+					uint8_t *e = rec + 8 + n * 8;
+					unsigned id_off = (id + 1 + adj) | (sdf_crc_ok(track + id, 5) ? 0 : SDF_CRC_ERROR);
+					unsigned size = 128 << (track[id + 4] & 3);
+					unsigned data_off = 0;
+					// The data mark follows within 43 bytes of the ID
+					for (unsigned p = id + 7; p < id + 7 + 43 && p + 1 + size + 2 <= tlen; p++) {
+						if (track[p - 1] == 0xa1 && track[p] >= 0xf8 && track[p] <= 0xfb) {
+							data_off = (p + 1 + adj) | (sdf_crc_ok(track + p, 1 + size) ? 0 : SDF_CRC_ERROR);
+							break;
+						}
+					}
+					e[0] = id_off;
+					e[1] = id_off >> 8;
+					e[2] = data_off;
+					e[3] = data_off >> 8;
+					memcpy(e + 4, track + id + 1, 4);
+					n++;
+				}
+				rec[0] = n;
+			}
+			fwrite(rec, sizeof(rec), 1, fd);
 		}
 	}
 	fclose(fd);

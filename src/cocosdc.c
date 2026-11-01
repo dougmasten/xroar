@@ -25,7 +25,10 @@
  * WD2793 and virtual drives as the RS-DOS cartridge.  Storing $43 in the
  * control latch ($FF40) switches it to "command mode", where $FF48-$FF4B
  * become a command interface for reading and writing logical sectors of the
- * mounted images and for operations on the SD card's files.
+ * mounted images and for operations on the SD card's files.  SDF images,
+ * which hold raw tracks for copy protected disks, are accessed through FDC
+ * emulation instead: the undocumented 'e' command tells SDC-DOS which drives
+ * hold them.
  *
  * SDC drives 0 and 1 are XRoar's floppy drives 0 and 1, so -load-fd0 and
  * -load-fd1 mount images in them.  The SD card is a host directory given
@@ -450,8 +453,12 @@ static uint8_t cocosdc_write(struct cart *c, uint16_t A, bool P2, bool R2, uint8
 			d->cmd_mode = 1;
 			LOG_MOD_DEBUG(3, "cocosdc", "command mode\n");
 		} else {
-			if (d->cmd_mode)
+			if (d->cmd_mode) {
 				LOG_MOD_DEBUG(3, "cocosdc", "FDC emulation mode\n");
+				// $FF4B keeps the last response byte: SDC-DOS
+				// reads the 'e' result after leaving command mode
+				wd279x_write(d->fdc, 3, d->param[2]);
+			}
 			d->cmd_mode = 0;
 			d->buf_count = 0;
 			event_dequeue(&d->ready_event);
@@ -849,6 +856,13 @@ static struct vdisk *drive_disk(struct cocosdc *d, unsigned drive) {
 	return vdrive_disk_in_drive(d->vdrive_interface, drive);
 }
 
+// SDF images hold raw tracks, for disks a sector dump can't represent.
+
+static bool drive_sdf(struct cocosdc *d, unsigned drive) {
+	struct vdisk *disk = drive_disk(d, drive);
+	return disk && disk->filetype == FILETYPE_SDF;
+}
+
 // Map a logical sector number to a cylinder, head and sector.  If ss is set,
 // the LSN assumes a single-sided disk.
 
@@ -1187,6 +1201,8 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 		}
 		memset(d->buf, 0, 256);
 		fat_record(d->buf, path);
+		if (drive_sdf(d, drive))
+			d->buf[11] |= 0x04;
 		send_block(d, 0);
 		return;
 	}
@@ -1233,9 +1249,9 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 		// Undocumented, sent by SDC-DOS before opening files: response
 		// byte 3 flags the drives (bit per drive select line) it should
 		// access through FDC emulation instead of logical sectors.
-		// Every image works by logical sector here, so none are flagged.
+		// Those are the drives holding SDF images.
 		d->delay = T_EXT;
-		d->param[2] = 0;
+		d->param[2] = (drive_sdf(d, 0) ? 1 : 0) | (drive_sdf(d, 1) ? 2 : 0);
 		d->status = 0;
 		return;
 	case 'g':

@@ -72,7 +72,7 @@ static const char *lpstrFilter =
 	"Binary files\0"    "*.BIN;*.HEX\0"
 	"Cassette images\0" "*.ASC;*.BAS;*.CAS;*.WAV\0"
 	"Cartridges\0"      "*.ROM;*.CCC\0"
-	"Disk images\0"     "*.DMK;*.DSK;*.JVC;*.OS9;*.VDK\0"
+	"Disk images\0"     "*.DMK;*.DSK;*.JVC;*.OS9;*.SDF;*.VDK\0"
 	"Snapshots\0"       "*.SNA\0"
 	;
 

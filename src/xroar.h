@@ -48,6 +48,7 @@ enum xroar_filetype {
 	FILETYPE_JVC,  // Basic, with optional headers
 	FILETYPE_OS9,  // JVC, but inspected to reveal OS9 metadata
 	FILETYPE_DMK,  // David Keil's format records more information
+	FILETYPE_SDF,  // CoCo SDC's format, similar to DMK
 
 	// Binary types
 	FILETYPE_BIN,  // Generic ".bin", needs analysing for subtype

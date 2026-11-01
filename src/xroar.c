@@ -771,7 +771,7 @@ static void do_load_binaries(void *);
 // I will want these back in some form, but they've never been used yet, so
 // they're commented out while I rejig how the file requesters work.
 
-static char const * const xroar_disk_exts[] = { "DMK", "JVC", "OS9", "VDK", "DSK", NULL };
+static char const * const xroar_disk_exts[] = { "DMK", "JVC", "OS9", "VDK", "DSK", "SDF", NULL };
 static char const * const xroar_tape_exts[] = { "CAS", "C10", "K7", NULL };
 static char const * const xroar_snap_exts[] = { "SNA", NULL };
 // static char const * const xroar_cart_exts[] = { "ROM", NULL };
@@ -789,6 +789,7 @@ static struct {
 	{ "DSK", FILETYPE_JVC },
 	{ "OS9", FILETYPE_OS9 },
 	{ "DMK", FILETYPE_DMK },
+	{ "SDF", FILETYPE_SDF },
 	{ "BIN", FILETYPE_BIN },
 	{ "DGN", FILETYPE_BIN },
 	{ "CCO", FILETYPE_BIN },
@@ -1606,6 +1607,7 @@ void xroar_load_file_by_type(const char *filename, int autorun) {
 	case FILETYPE_JVC:
 	case FILETYPE_OS9:
 	case FILETYPE_DMK:
+	case FILETYPE_SDF:
 		xroar_load_disk(filename, load_disk_to_drive, autorun);
 		return;
 
@@ -1794,6 +1796,7 @@ void xroar_new_disk(int drive) {
 		case FILETYPE_JVC:
 		case FILETYPE_OS9:
 		case FILETYPE_DMK:
+		case FILETYPE_SDF:
 			break;
 		default:
 			filetype = FILETYPE_DMK;
@@ -2661,6 +2664,7 @@ static enum media_slot add_load_file(const char *filename) {
 	case FILETYPE_JVC:
 	case FILETYPE_OS9:
 	case FILETYPE_DMK:
+	case FILETYPE_SDF:
 		for (unsigned i = 0; i < 4; i++) {
 			if (!private_cfg.file.fd[i]) {
 				private_cfg.file.fd[i] = xstrdup(filename);
