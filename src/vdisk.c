@@ -750,7 +750,7 @@ static struct vdisk *vdisk_load_dmk(const char *filename) {
 	}
 	file_size -= 16;
 	(void)file_size;  // TODO: check this matches what's going to be read
-	disk = vdisk_new(VDISK_TRACK_LENGTH_DD300);
+	disk = vdisk_new(track_length);
 	LOG_MOD_SUB_DEBUG(1, "vdisk", "dmk", "%s: reading: %uC %uH (%u-byte)%s\n", filename, ncyls, nheads, track_length, density_message);
 	disk->filetype = FILETYPE_DMK;
 	disk->filename = xstrdup(filename);
@@ -1135,11 +1135,11 @@ bool vdisk_write_sector(struct vdisk_ctx *ctx, unsigned cyl, unsigned head,
 				ctx->crc = CRC16_CCITT_RESET;
 			}
 			write_bytes(ctx, 1, 0xfb);
-			unsigned vseclen = 128 << vidam.ssize_code;
+			unsigned vseclen = 128 << (vidam.ssize_code & 3);
 			unsigned j = 0;
 			while (j < ssize && j < vseclen)
 				write_bytes(ctx, 1, buf[j++]);
-			while (j < vseclen)
+			for (; j < vseclen; j++)
 				write_bytes(ctx, 1, 0);
 			write_crc(ctx);
 			ctx->data_crc_error = 0;
@@ -1178,11 +1178,11 @@ bool vdisk_read_sector(struct vdisk_ctx *ctx, unsigned cyl, unsigned head,
 				vdisk_errno = vdisk_err_dam_not_found;
 				return 0;
 			}
-			unsigned vseclen = 128 << vidam.ssize_code;
+			unsigned vseclen = 128 << (vidam.ssize_code & 3);
 			j = 0;
 			while (j < ssize && j < vseclen)
 				buf[j++] = read_byte(ctx);
-			while (j < vseclen)
+			for (; j < vseclen; j++)
 				(void)read_byte(ctx);
 			ctx->data_crc_error = !read_crc(ctx);
 			return 1;
