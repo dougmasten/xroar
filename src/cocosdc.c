@@ -1298,9 +1298,18 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 		d->delay += T_LIST;
 		return start_listing(d, arg);
 	case 'K': {
+		// As in the firmware, an existing directory is fine, but not
+		// a file of that name
 		d->delay += T_DIR + 2 * T_SD_WRITE;
 		sds host = resolve_path(d, arg, 0, NULL);
-		uint8_t r = (host && mkdir(host, 0777) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
+		struct stat st;
+		uint8_t r;
+		if (!host)
+			r = STA_FAILED | STA_NOTFOUND;
+		else if (stat(host, &st) == 0)
+			r = S_ISDIR(st.st_mode) ? 0 : (STA_FAILED | STA_INUSE);
+		else
+			r = (mkdir(host, 0777) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
 		sdsfree(host);
 		return r;
 	}
