@@ -925,7 +925,8 @@ static void wd279x_state_machine(void *sptr) {
 
 
 		case WD279X_state_write_sector_6:
-			wd279x_write_byte(fdc, 0xfe);
+			// One byte of gap after the CRC
+			wd279x_write_byte(fdc, IS_DOUBLE_DENSITY(fdc) ? 0x4e : 0xff);
 			if (fdc->command_register & 0x10) {
 				// XXX what happens on overflow here?
 				fdc->sector_register++;

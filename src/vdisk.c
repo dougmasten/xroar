@@ -1350,7 +1350,7 @@ bool vdisk_write_sector(struct vdisk_ctx *ctx, unsigned cyl, unsigned head,
 				write_bytes(ctx, 1, 0);
 			write_crc(ctx);
 			ctx->data_crc_error = 0;
-			write_bytes(ctx, 1, 0xfe);
+			write_bytes(ctx, 1, ctx->dden ? 0x4e : 0xff);
 			return 1;
 		}
 	}
