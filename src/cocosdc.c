@@ -180,6 +180,7 @@ struct cocosdc {
 	bool cmd_mode;
 	uint8_t cmd;
 	uint8_t status;
+	uint8_t block_status;  // status once a block has been read
 	uint8_t param[3];
 	uint8_t buf[256];
 	unsigned buf_pos;
@@ -1205,12 +1206,20 @@ static uint8_t read_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool ss
 	unsigned cyl, head, sector;
 	if (!lsn_chs(disk, lsn, ss, &cyl, &head, &sector))
 		return STA_FAILED | STA_NOTFOUND;
-	// vdisk_read_sector() doesn't check the data CRC reliably, so CRC
-	// errors aren't reported.
 	struct vdisk_ctx *ctx = vdisk_ctx_new(disk);
 	bool ok = vdisk_read_sector(ctx, cyl, head, sector, 256, d->buf);
+	bool id_crc = ctx->idam_crc_error;
+	bool data_crc = ctx->data_crc_error;
 	vdisk_ctx_free(ctx);
-	return ok ? 0 : (STA_FAILED | STA_NOTFOUND);
+	if (!ok)
+		return STA_FAILED | STA_NOTFOUND;
+	// As in the firmware, a sector whose ID has a bad CRC isn't found, and
+	// one whose data has a bad CRC is read, the error being reported once
+	// it's transferred.  Only images holding raw tracks (SDF) can have
+	// them.
+	if (id_crc)
+		return STA_FAILED | STA_NOTFOUND | STA_CRC;
+	return data_crc ? STA_CRC : 0;
 }
 
 static uint8_t write_lsn(struct cocosdc *d, unsigned drive, unsigned lsn, bool ss) {
@@ -1656,12 +1665,15 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 
 // Start sending a block to the CoCo, or finish with a status.
 
+// Send a block to the CoCo, then report status, unless that's a failure.
+
 static void send_block(struct cocosdc *d, uint8_t status) {
-	if (status) {
+	if (status & STA_FAILED) {
 		d->status = status;
 		d->buf_count = 0;
 		return;
 	}
+	d->block_status = status;
 	d->buf_pos = 0;
 	d->buf_count = 256;
 	d->buf_rx = 0;
@@ -1922,7 +1934,7 @@ static uint8_t cmd_read(struct cocosdc *d, unsigned reg) {
 	if (d->buf_count && !d->buf_rx && (reg == 3 || (reg == 2 && !d->byte_mode))) {
 		uint8_t v = d->buf[d->buf_pos++];
 		if (--d->buf_count == 0 && !(d->status & STA_FAILED))
-			d->status = 0;
+			d->status = d->block_status;
 		else if (d->buf_count == 0)
 			d->status &= ~(STA_BUSY | STA_READY);
 		return v;
