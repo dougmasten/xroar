@@ -80,6 +80,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "array.h"
 #include "delegate.h"
@@ -1152,7 +1153,27 @@ static sds resolve_path(struct cocosdc *d, const char *path, unsigned flags, sds
 	return host;
 }
 
-// Fill a 32 byte FAT style directory record for a host file.
+// Store a host time as FAT's date and time, in a directory record.  FAT
+// dates start in 1980.
+
+static void fat_time(uint8_t *rec, unsigned ofs_time, unsigned ofs_date, time_t t) {
+	struct tm *tm = localtime(&t);
+	unsigned date = (1 << 5) | 1;  // 1980-01-01
+	unsigned time = 0;
+	if (tm && tm->tm_year >= 80) {
+		date = ((tm->tm_year - 80) << 9) | ((tm->tm_mon + 1) << 5) | tm->tm_mday;
+		time = (tm->tm_hour << 11) | (tm->tm_min << 5) | (tm->tm_sec / 2);
+	}
+	if (ofs_time) {
+		rec[ofs_time] = time;
+		rec[ofs_time + 1] = time >> 8;
+	}
+	rec[ofs_date] = date;
+	rec[ofs_date + 1] = date >> 8;
+}
+
+// Fill a 32 byte FAT style directory record for a host file.  The host's
+// modification time stands in for the creation and access times too.
 
 static void fat_record(uint8_t *rec, const char *host) {
 	memset(rec, 0, 32);
@@ -1161,6 +1182,9 @@ static void fat_record(uint8_t *rec, const char *host) {
 	name_83(leaf, (char *)rec, (char *)rec + 8);
 	struct stat st;
 	if (stat(host, &st) == 0) {
+		fat_time(rec, 14, 16, st.st_mtime);  // created
+		fat_time(rec, 0, 18, st.st_mtime);   // accessed
+		fat_time(rec, 22, 24, st.st_mtime);  // modified
 		if (S_ISDIR(st.st_mode)) {
 			rec[11] = 0x10;
 		} else {
