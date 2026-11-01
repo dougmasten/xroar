@@ -33,7 +33,9 @@
  * SDC drives 0 and 1 are XRoar's floppy drives 0 and 1, so -load-fd0 and
  * -load-fd1 mount images in them.  The SD card is a host directory given
  * with -load-hd0; commands that mount images or list directories work
- * within it, and its STARTUP.CFG mounts images at power up.  A file can
+ * within it, and its STARTUP.CFG mounts images at power up.  As on the real
+ * card, only names that fit 8.3 are visible, matched case-insensitively, and
+ * "M:" accepts wildcards and a name without its extension.  A file can
  * also be mounted as an array of raw 256 byte blocks ("m:"), accessible by
  * logical sector number or streaming but not through FDC emulation.
  * Mounting a directory in drive 0 mounts a disk set: images in it named
@@ -179,6 +181,7 @@ struct cocosdc {
 	int msgr_client_id;
 	char *sd_root;
 	sds cur_dir;  // relative to sd_root, no leading or trailing '/'
+	uint8_t path_status;  // why resolve_path() last failed
 	struct {
 		sds path;  // host path of a file mounted as raw blocks
 		FILE *raw;  // open if mounted as raw blocks ("m:" or "n:")
@@ -610,35 +613,102 @@ static bool name_83(const char *s, char name[8], char ext[3]) {
 	return 1;
 }
 
-// Find a directory entry matching name case-insensitively (FAT names aren't
-// case sensitive).  Returns a new sds, or NULL.
+// Convert a name given by the CoCo to an 11 character 8.3 pattern, as the
+// firmware does: upper case, padded with spaces, and if wild is set, '*' and
+// '?' as wildcards ('*' fills the rest of the name or extension with '?').
+// Returns false if the name isn't valid.
 
-static sds find_entry(const char *dir, const char *name) {
+static bool pattern_83(const char *s, bool wild, char pat[11], bool *has_wild) {
+	memset(pat, ' ', 11);
+	*has_wild = 0;
+	unsigned i = 0;
+	bool ext = 0;
+	for (; *s; s++) {
+		char c = *s;
+		if (c == '*') {
+			if (!wild)
+				return 0;
+			unsigned lim = (i < 8) ? 8 : 11;
+			for (; i < lim; i++)
+				pat[i] = '?';
+			*has_wild = 1;
+			continue;
+		}
+		if (c == '.') {
+			if (ext || i >= 9)
+				return 0;
+			ext = 1;
+			i = 8;
+			continue;
+		}
+		if (i >= 11 || (unsigned char)c < ' ')
+			return 0;
+		if (c == '?') {
+			if (!wild)
+				return 0;
+			*has_wild = 1;
+		} else if (strchr("\"/:<>\\|+,;=[]", c)) {
+			return 0;
+		}
+		pat[i++] = toupper((unsigned char)c);
+	}
+	return pat[0] != ' ';
+}
+
+// Find the entry in a host directory matching an 8.3 pattern.  Only host
+// names that fit 8.3 are visible, and they match case-insensitively (FAT
+// names aren't case sensitive).  If several match, the first in name order
+// stands in for the first in the directory.  Returns a new sds, or NULL.
+
+static sds find_entry(const char *dir, const char pat[11]) {
 	DIR *dh = opendir(dir);
 	if (!dh)
 		return NULL;
 	sds found = NULL;
+	char best[11];
 	struct dirent *de;
 	while ((de = readdir(dh))) {
-		if (strcasecmp(de->d_name, name) == 0) {
-			found = sdsnew(de->d_name);
-			break;
-		}
+		char name[11];
+		if (de->d_name[0] == '.' || !name_83(de->d_name, name, name + 8))
+			continue;
+		bool match = 1;
+		for (unsigned i = 0; i < 11 && match; i++)
+			match = (pat[i] == '?' || pat[i] == name[i]);
+		if (!match || (found && memcmp(name, best, 11) >= 0))
+			continue;
+		sdsfree(found);
+		found = sdsnew(de->d_name);
+		memcpy(best, name, 11);
 	}
 	closedir(dh);
 	return found;
 }
 
-// Resolve an SDC path name to a host path.  If must_exist is false, the leaf
-// need not exist (it's taken as given).  rel, if not NULL, receives the path
-// relative to the SD root.  Returns a new sds or NULL.
+// Resolve an SDC path name to a host path, like the firmware.  Flags apply
+// to the last element:
+//
+// - RP_NEW:     it need not exist (the 8.3 form of the name is used)
+// - RP_WILD:    it may contain wildcards
+// - RP_ANYEXT:  a missing extension matches any
+//
+// rel, if not NULL, receives the path relative to the SD root.  Returns a new
+// sds, or NULL with the reason in d->path_status.
 
-static sds resolve_path(struct cocosdc *d, const char *path, bool must_exist, sds *rel) {
+#define RP_NEW    (1 << 0)
+#define RP_WILD   (1 << 1)
+#define RP_ANYEXT (1 << 2)
+
+static sds resolve_path(struct cocosdc *d, const char *path, unsigned flags, sds *rel) {
+	d->path_status = STA_FAILED | STA_NOTFOUND;
 	if (!d->sd_root)
 		return NULL;
 	sds r = (path[0] == '/') ? sdsempty() : sdsdup(d->cur_dir);
 	int ncomp;
 	sds *comp = sdssplitlen(path, strlen(path), "/", 1, &ncomp);
+	// The last element that isn't empty (a trailing '/' is allowed)
+	int last = ncomp - 1;
+	while (last > 0 && sdslen(comp[last]) == 0)
+		last--;
 	bool ok = 1;
 	for (int i = 0; i < ncomp && ok; i++) {
 		if (sdslen(comp[i]) == 0 || strcmp(comp[i], ".") == 0)
@@ -651,15 +721,35 @@ static sds resolve_path(struct cocosdc *d, const char *path, bool must_exist, sd
 				sdsclear(r);
 			continue;
 		}
+		char pat[11];
+		bool has_wild;
+		if (!pattern_83(comp[i], i == last && (flags & RP_WILD), pat, &has_wild)) {
+			d->path_status = STA_FAILED | STA_INVALID;
+			ok = 0;
+			break;
+		}
+		if (i == last && (flags & RP_ANYEXT) && memcmp(pat + 8, "   ", 3) == 0)
+			memset(pat + 8, '?', 3);
 		sds dir = sdscatfmt(sdsnew(d->sd_root), "/%S", r);
-		sds found = find_entry(dir, comp[i]);
+		sds found = find_entry(dir, pat);
 		sdsfree(dir);
 		if (!found) {
-			if (must_exist || i != ncomp - 1) {
+			if (i != last || !(flags & RP_NEW) || has_wild) {
 				ok = 0;
 				break;
 			}
-			found = sdsdup(comp[i]);
+			// A new file gets the 8.3 form of its name
+			int n = 8;
+			while (n > 0 && pat[n - 1] == ' ')
+				n--;
+			found = sdsnewlen(pat, n);
+			if (pat[8] != ' ') {
+				int e = 11;
+				while (pat[e - 1] == ' ')
+					e--;
+				found = sdscat(found, ".");
+				found = sdscatlen(found, pat + 8, e - 8);
+			}
 		}
 		if (sdslen(r))
 			r = sdscat(r, "/");
@@ -748,10 +838,10 @@ static uint8_t start_listing(struct cocosdc *d, const char *arg) {
 	if (!*pat)
 		pat = "*.*";
 	sds rel = NULL;
-	sds host = resolve_path(d, sdslen(dirpath) ? dirpath : ".", 1, &rel);
+	sds host = resolve_path(d, sdslen(dirpath) ? dirpath : ".", 0, &rel);
 	sdsfree(dirpath);
 	if (!host)
-		return STA_FAILED | STA_NOTFOUND;
+		return d->path_status;
 	DIR *dh = opendir(host);
 	if (!dh) {
 		sdsfree(host);
@@ -1150,9 +1240,19 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 		return 0;
 	}
 	d->delay += T_DIR;
-	sds host = resolve_path(d, path, !create, NULL);
+	// "M:" takes the first match of wildcards, and if nothing matches,
+	// tries again with a missing extension matching any.  "N:" needs the
+	// exact name, and creates the file if it's not found.
+	sds host;
+	if (create) {
+		host = resolve_path(d, path, RP_NEW, NULL);
+	} else {
+		host = resolve_path(d, path, RP_WILD, NULL);
+		if (!host && d->path_status == (STA_FAILED | STA_NOTFOUND))
+			host = resolve_path(d, path, RP_WILD | RP_ANYEXT, NULL);
+	}
 	if (!host)
-		return STA_FAILED | STA_NOTFOUND;
+		return d->path_status;
 	struct stat st;
 	bool created = 0;
 	if (stat(host, &st) != 0) {
@@ -1224,7 +1324,7 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 static uint8_t set_dir(struct cocosdc *d, const char *path);
 
 static void load_startup_cfg(struct cocosdc *d) {
-	sds host = resolve_path(d, "/STARTUP.CFG", 1, NULL);
+	sds host = resolve_path(d, "/STARTUP.CFG", 0, NULL);
 	if (!host)
 		return;
 	FILE *f = fopen(host, "rb");
@@ -1257,9 +1357,10 @@ static void load_startup_cfg(struct cocosdc *d) {
 static uint8_t set_dir(struct cocosdc *d, const char *path) {
 	d->delay += T_DIR;
 	sds rel = NULL;
-	sds host = resolve_path(d, *path ? path : "/", 1, &rel);
+	// Wildcards are allowed, but the first match must be a directory
+	sds host = resolve_path(d, *path ? path : "/", RP_WILD, &rel);
 	if (!host)
-		return STA_FAILED | STA_NOTFOUND;
+		return d->path_status;
 	struct stat st;
 	bool ok = stat(host, &st) == 0 && S_ISDIR(st.st_mode);
 	sdsfree(host);
@@ -1279,13 +1380,16 @@ static uint8_t set_dir(struct cocosdc *d, const char *path) {
 
 static uint8_t rename_file(struct cocosdc *d, const char *from, const char *to) {
 	d->delay += 2 * T_DIR + T_SD_WRITE;
-	sds old = resolve_path(d, from, 1, NULL);
-	sds new = resolve_path(d, to, 0, NULL);
+	sds old = resolve_path(d, from, 0, NULL);
+	uint8_t old_status = d->path_status;
+	sds new = resolve_path(d, to, RP_NEW, NULL);
 	char name[8], ext[3];
 	struct stat st;
 	uint8_t r = 0;
-	if (!old || !new) {
-		r = STA_FAILED | STA_NOTFOUND;
+	if (!old) {
+		r = old_status;
+	} else if (!new) {
+		r = d->path_status;
 	} else if (!name_83(strrchr(new, '/') + 1, name, ext)) {
 		r = STA_FAILED | STA_INVALID;
 	} else if (strcmp(old, new) == 0) {
@@ -1327,11 +1431,11 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 		// As in the firmware, an existing directory is fine, but not
 		// a file of that name
 		d->delay += T_DIR;
-		sds host = resolve_path(d, arg, 0, NULL);
+		sds host = resolve_path(d, arg, RP_NEW, NULL);
 		struct stat st;
 		uint8_t r;
 		if (!host) {
-			r = STA_FAILED | STA_NOTFOUND;
+			r = d->path_status;
 		} else if (stat(host, &st) == 0) {
 			r = S_ISDIR(st.st_mode) ? 0 : (STA_FAILED | STA_INUSE);
 		} else {
@@ -1353,8 +1457,8 @@ static uint8_t sd_command(struct cocosdc *d, unsigned drive) {
 	}
 	case 'X': {
 		d->delay += T_DIR + T_SD_WRITE;
-		sds host = resolve_path(d, arg, 1, NULL);
-		uint8_t r = (host && remove(host) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
+		sds host = resolve_path(d, arg, 0, NULL);
+		uint8_t r = !host ? d->path_status : (remove(host) == 0) ? 0 : (STA_FAILED | STA_NOTFOUND);
 		sdsfree(host);
 		return r;
 	}
