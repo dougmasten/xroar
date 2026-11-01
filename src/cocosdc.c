@@ -36,6 +36,8 @@
  * within it, and its STARTUP.CFG mounts images at power up.  A file can
  * also be mounted as an array of raw 256 byte blocks ("m:"), accessible by
  * logical sector number or streaming but not through FDC emulation.
+ * Mounting a directory in drive 0 mounts a disk set: images in it named
+ * "FOO1.DSK" to "FOO9.DSK", switched with the '#' and '+' commands.
  *
  * The 128K of flash is eight 16K banks mapped at $C000-$FEFF.  By default
  * bank 0 holds SDC-DOS, bank 1 RS-DOS, bank 4 "dplus-sdc" and bank 5 a
@@ -114,6 +116,8 @@
 #define T_STREAM1 EVENT_US(420)   // first block of a stream
 #define T_STREAM  EVENT_US(220)   // each later block, once the last is read
 #define T_ABORT   EVENT_US(1720)  // abort a stream
+#define T_SCAN    EVENT_US(680)   // look for a disk in the set's directory
+#define T_BLINK   EVENT_MS(380)   // blink the LED once (38 x 10ms delays)
 
 // These depend on the SD card: typical values.
 #define T_SD_READ  EVENT_US(1300)  // read a 512 byte block
@@ -177,6 +181,8 @@ struct cocosdc {
 		bool raw_ro;
 		bool written;  // directory entry to update on unmount
 	} drv[2];
+	sds set_dir;  // host directory of the disk set in drive 0
+	unsigned set_num;  // disk number in the set (1-9)
 
 	// Streaming ($90/$91): 512 byte blocks of a mounted file
 	FILE *stream;
@@ -341,6 +347,7 @@ static void cocosdc_free(struct part *p) {
 		if (d->drv[i].raw)
 			fclose(d->drv[i].raw);
 	}
+	sdsfree(d->set_dir);
 	if (d->stream)
 		fclose(d->stream);
 	free(d->listing);
@@ -965,6 +972,11 @@ static void unmount(struct cocosdc *d, unsigned drive) {
 	d->drv[drive].path = NULL;
 	if (drive_disk(d, drive))
 		xroar_eject_disk(drive);
+	if (drive == 0) {
+		sdsfree(d->set_dir);
+		d->set_dir = NULL;
+		d->set_num = 0;
+	}
 }
 
 // Fill a newly created disk image.  $FF4A gives the number of sides: zero
@@ -1003,6 +1015,115 @@ static uint8_t new_image(struct cocosdc *d, FILE *f) {
 	return 0;
 }
 
+// Disk sets: mounting a directory puts the disk images inside it named like
+// "FOOn.DSK", n from 1 to 9, in drive 0.  The '#' command then selects a
+// disk by number, and '+' the next one.
+
+// Find a member of a disk set: an image whose name ends with the digit ch.
+// The first in name order wins.  Returns a new sds, or NULL.
+
+static sds set_member(const char *dir, char ch) {
+	DIR *dh = opendir(dir);
+	if (!dh)
+		return NULL;
+	struct sdc_dirent best = {0};
+	sds found = NULL;
+	struct dirent *de;
+	while ((de = readdir(dh))) {
+		struct sdc_dirent e = {0};
+		if (de->d_name[0] == '.' || !name_83(de->d_name, e.name, e.ext))
+			continue;
+		int i = 7;
+		while (i > 0 && e.name[i] == ' ')
+			i--;
+		if (e.name[i] != ch)
+			continue;
+		if (found && dirent_cmp(&e, &best) >= 0)
+			continue;
+		sds p = sdscatfmt(sdsnew(dir), "/%s", de->d_name);
+		struct stat st;
+		if (stat(p, &st) != 0 || S_ISDIR(st.st_mode)) {
+			sdsfree(p);
+			continue;
+		}
+		sdsfree(found);
+		found = p;
+		best = e;
+	}
+	closedir(dh);
+	return found;
+}
+
+// Mount a disk of the set in drive 0: disk number mode (1-9), or if that's
+// zero, the next disk that exists after the current one.  If the requested
+// disk isn't there, the previous one is mounted again, but the command still
+// fails.  If nothing could be mounted, the set is forgotten.
+
+static uint8_t set_select(struct cocosdc *d, unsigned mode) {
+	if (!d->set_dir || mode > 9)
+		return STA_FAILED | STA_NOTFOUND;
+	// Unmounting drive 0 forgets the set
+	sds dir = d->set_dir;
+	d->set_dir = NULL;
+	unsigned num = d->set_num;
+	unsigned tries = mode ? 2 : 9;
+	// Remounting the same image finds its first block still buffered
+	sds old = (d->sd_block == 0 && drive_path(d, 0)) ? sdsnew(drive_path(d, 0)) : NULL;
+	do {
+		unmount(d, 0);
+		char ch;
+		if (mode) {
+			ch = '0' + mode;
+		} else {
+			if (++num >= 10)
+				num = 1;
+			ch = '0' + num;
+		}
+		d->delay += T_SCAN;
+		sds host = set_member(dir, ch);
+		const char *other = drive_path(d, 1);
+		if (host && !(other && strcmp(other, host) == 0)) {
+			if (!old || strcmp(old, host) != 0)
+				d->delay += T_SD_READ;
+			sd_flush(d);
+			d->sd_block = 0;
+			xroar_insert_disk_file(0, host);
+		}
+		sdsfree(host);
+		if (drive_disk(d, 0)) {
+			sdsfree(old);
+			d->set_dir = dir;
+			d->set_num = ch - '0';
+			return (mode && tries == 1) ? (STA_FAILED | STA_NOTFOUND) : 0;
+		}
+		if (mode && num)
+			mode = num;
+	} while (--tries);
+	sdsfree(old);
+	sdsfree(dir);
+	return STA_FAILED | STA_NOTFOUND;
+}
+
+// Mount the disk set in directory host (consumed).  Only drive 0 can hold a
+// set, and only "M:" mounts one.
+
+static uint8_t mount_set(struct cocosdc *d, unsigned drive, sds host, bool not_m) {
+	if (not_m) {
+		sdsfree(host);
+		return STA_FAILED | STA_INUSE;
+	}
+	unmount(d, drive);
+	if (drive != 0) {
+		sdsfree(host);
+		return STA_FAILED | STA_NOTFOUND;
+	}
+	d->set_dir = host;
+	d->set_num = 0;
+	// Reading the directory, which then stays in the MCU's buffer
+	d->delay += T_SD_READ;
+	return set_select(d, 0);
+}
+
 // Mount a file: as a disk image through the floppy drives, or as raw blocks
 // (raw files can't be accessed through FDC emulation).  If create is set,
 // the file is created first if it doesn't exist (see new_image()).
@@ -1037,8 +1158,7 @@ static uint8_t mount_file(struct cocosdc *d, unsigned drive, const char *path, b
 			return r;
 		}
 	} else if (S_ISDIR(st.st_mode)) {
-		sdsfree(host);
-		return STA_FAILED | STA_NOTFOUND;
+		return mount_set(d, drive, host, raw || create);
 	}
 	const char *other = drive_path(d, drive ^ 1);
 	if (other && strcmp(other, host) == 0) {
@@ -1292,6 +1412,20 @@ static void ext_command(struct cocosdc *d, unsigned drive) {
 		d->flags = (d->flags & d->param[1]) | d->param[2];
 		d->status = 0;
 		return;
+	case '+':
+		// Next disk of the set, then blink its number on the LED
+		d->param[1] = 0;
+		d->param[2] = 1;
+		// fall through
+	case '#': {
+		// Disk of the set given in byte 2 (0 for the next one), the LED
+		// blinking its number if bit 0 of byte 3 is set
+		d->delay = T_EXT;
+		d->status = (drive == 0) ? set_select(d, d->param[1]) : (STA_FAILED | STA_NOTFOUND);
+		if (!d->status && (d->param[2] & 1))
+			d->delay += d->set_num * T_BLINK;
+		return;
+	}
 	case 'V':
 		d->delay = T_EXT;
 		d->param[1] = SDC_VERSION >> 8;
