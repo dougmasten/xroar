@@ -1084,6 +1084,66 @@ Type @samp{rsdos}.  Built-in cartridge profile @samp{rsdos}, @samp{becker}
 
 @c
 
+@node CoCo SDC
+@subsection CoCo SDC
+
+Darren Atkinson's CoCo SDC replaces the CoCo's floppy controller with an SD
+card holding disk images.  Its emulation is experimental: it's only available
+if XRoar was configured with @option{--enable-experimental}.
+
+The SD card is a directory on the host, given with @option{-load-hd0
+@var{dir}}.  As on the real card, only files whose names fit 8.3 are visible,
+and names match regardless of case.  A @file{STARTUP.CFG} in that directory
+mounts images at power up, one per line: @samp{0=@var{file}} and
+@samp{1=@var{file}} for the drives, @samp{D=@var{dir}} for the current
+directory.
+
+SDC drives 0 and 1 are XRoar's floppy drives 0 and 1, so images can also be
+inserted with @option{-load-fd0} and @option{-load-fd1}.  Most software uses
+SDC-DOS's commands, which read and write logical sectors, but the controller
+also emulates a WD1793 for software that accesses the drives directly.
+Supported images:
+
+@itemize @bullet
+@item JVC/DSK, VDK and DMK images.
+@item SDF images, the CoCo SDC's own raw track format, used for copy protected
+disks.  These are always accessed through the emulated WD1793, and can be
+created with the @samp{N:} command.
+@item Directories: mounting one in drive 0 mounts the disk set inside it,
+images named like @file{GAME1.DSK} to @file{GAME9.DSK}, switched with the
+@samp{#} and @samp{+} commands.
+@item Any file, as raw 256 byte blocks (the @samp{m:} and @samp{n:} commands).
+@end itemize
+
+A file whose extension isn't a known disk image type is identified by its
+contents.
+
+The 128K of flash holds eight 16K banks: SDC-DOS in bank 0 (ROM
+@samp{sdcdos}, or the image given with @option{-cart-rom}), RS-DOS in bank 1,
+@samp{dplus-sdc} in bank 4 and a DragonDOS compatible DOS in bank 5.  SDC-DOS
+has separate builds for the CoCo 1/2 and the CoCo 3, so use the one that
+matches the machine.  Flash programming (e.g., SDC-DOS's @samp{KILL MEM} and
+@samp{WRITE MEM}) is emulated.  Programmed contents survive resets; to keep
+them, use @option{-cart-opt sdc-flash=@var{file}}.  If @var{file} exists, it's
+loaded instead of the default banks, and it's rewritten on exit if the flash
+was changed.
+
+Commands take as long as they did on a real CoCo SDC with a Toshiba FlashAir
+card, as that's where they were measured.  The controller's own time varies
+little, but the SD card's varies a lot from card to card.  With
+@option{-cart-opt sdc-card=instant}, SD card access takes no time, leaving
+only the controller's own (@samp{sdc-card=normal} is the default).
+
+For example:
+
+@example
+xroar -m coco3 -cart cocosdc -load-hd0 ~/sdcard
+@end example
+
+Type @samp{cocosdc}.  Built-in cartridge profile @samp{cocosdc}.
+
+@c
+
 @node Glenside IDE controller
 @subsection Glenside IDE controller
 
@@ -1855,6 +1915,8 @@ extensions with @option{-no-disk-auto-os9}.
 @multitable @columnfractions .21 .75
 @item @option{-load-hd@var{X} @var{file}}
 @tab Use @var{file} as the hard disk image for drive @var{X} (0 or 1).
+For the CoCo SDC, @option{-load-hd0} gives the directory to use as its SD
+card.
 @end multitable
 
 @c
