@@ -46,8 +46,15 @@
  * DragonDOS compatible DOS.  A ROM image given with -cart-rom fills banks from
  * 0 instead.  Writing $FF43 selects the bank (low three bits).  Reading $FF43
  * returns the bank number in the low three bits and the top five bits of the
- * last value written to $FF42, which is how software detects the SDC.  Flash
- * programming is not emulated: writes to the flash are ignored.
+ * last value written to $FF42, which is how software detects the SDC.
+ *
+ * The flash is an SST39SF010A.  Setting bit 7 of $FF43 enables programming:
+ * a value written to $FF42 is then written to the flash by the next read of
+ * the ROM area, at that address.  That's how the JEDEC command sequences
+ * (with their $5555/$2AAA addresses spanning banks 0 and 1) reach the chip.
+ * Programmed contents survive resets.  With "-cart-opt flash=FILE" they're
+ * kept in a 128K image file: if it exists, it's loaded instead of the default
+ * banks, and it's rewritten on exit if the flash was changed.
  *
  * Commands take time, as on the real controller: BUSY stays set until a
  * command completes, and READY is only set once a block can be transferred.
@@ -88,6 +95,7 @@
 #include "vdisk.h"
 #include "vdrive.h"
 #include "wd279x.h"
+#include "xconfig.h"
 #include "xroar.h"
 
 #define SDC_BANK_SIZE (0x4000)
@@ -157,6 +165,16 @@ struct cocosdc {
 	// Flash
 	unsigned bank;
 	uint8_t flash_data;
+	bool flash_enable;  // $FF43 bit 7: programming enabled
+	bool flash_armed;  // $FF42 written: the next ROM read writes it
+	unsigned flash_state;  // position in a command sequence
+	bool flash_id;  // software ID mode
+	bool flash_busy;  // programming or erasing...
+	event_ticks flash_busy_until;  // ...until then
+	uint8_t flash_status;  // bit 7 read while busy
+	bool flash_toggle;  // bit 6 read while busy
+	bool flash_modified;
+	char *flash_file;
 
 	// Command mode
 	bool cmd_mode;
@@ -225,6 +243,15 @@ static const struct ser_struct_data cocosdc_ser_struct_data = {
 	.num_elems = ARRAY_N_ELEMENTS(ser_struct_cocosdc),
 };
 
+static struct xconfig_option const cocosdc_options[] = {
+	{ XCO_SET_STRING("flash", struct cocosdc, flash_file) },
+};
+
+static const struct xconfig_set cocosdc_option_set = {
+	ARRAY_N_ELEMENTS(cocosdc_options),
+	cocosdc_options
+};
+
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 static void cocosdc_config_complete(struct cart_config *);
@@ -247,6 +274,7 @@ static void load_startup_cfg(struct cocosdc *d);
 static void ready_done(void *sptr);
 
 static void cocosdc_ui_set_hd_filename(void *sptr, int tag, void *smsg);
+static void flash_save(struct cocosdc *d);
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -298,6 +326,9 @@ static void cocosdc_initialise(struct part *p, void *options) {
 
 	cart_rom_initialise(p, options);
 	part_add_component(p, part_create("WD2793", "WD2793"), "FDC");
+
+	struct cocosdc *d = (struct cocosdc *)p;
+	xconfig_parse_list_struct(&cocosdc_option_set, cc->opts, d);
 }
 
 // Load a ROM image into a flash bank, unless the bank already holds one.
@@ -323,6 +354,12 @@ static bool cocosdc_finish(struct part *p) {
 	// A ROM image given with -cart-rom fills banks from 0, otherwise bank
 	// 0 holds SDC-DOS.  Banks still empty get the default layout.
 	c->ROM = rombank_new(8, SDC_BANK_SIZE, SDC_NBANKS);
+	// A flash image file holds all the banks
+	if (d->flash_file) {
+		struct stat st;
+		if (stat(d->flash_file, &st) == 0)
+			rombank_load_image(c->ROM, 0, d->flash_file, 0);
+	}
 	load_bank(c->ROM, 0, c->config->rom ? c->config->rom : "sdcdos");
 	load_bank(c->ROM, 1, "@rsdos");
 	load_bank(c->ROM, 4, "dplus-sdc");
@@ -346,6 +383,8 @@ static bool cocosdc_finish(struct part *p) {
 
 static void cocosdc_free(struct part *p) {
 	struct cocosdc *d = (struct cocosdc *)p;
+	flash_save(d);
+	free(d->flash_file);
 	event_dequeue(&d->ready_event);
 	messenger_client_unregister(d->msgr_client_id);
 	free(d->sd_root);
@@ -390,7 +429,13 @@ static void cocosdc_ui_set_hd_filename(void *sptr, int tag, void *smsg) {
 
 static void cocosdc_reset(struct cart *c, bool hard) {
 	struct cocosdc *d = (struct cocosdc *)c;
-	cart_rom_reset(c, hard);
+	// Reloading the ROM images would undo any flash programming
+	if (!d->flash_modified)
+		cart_rom_reset(c, hard);
+	d->flash_enable = d->flash_armed = 0;
+	d->flash_busy = 0;
+	d->flash_state = 0;
+	d->flash_id = 0;
 	wd279x_reset(d->fdc);
 	d->latch_old = -1;
 	d->latch_drive_select = -1;
@@ -419,11 +464,144 @@ static void cocosdc_detach(struct cart *c) {
 	cart_rom_detach(c);
 }
 
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+// Flash: an SST39SF010A, 128K in 4K sectors
+
+#define FLASH_SIZE   (SDC_NBANKS * SDC_BANK_SIZE)
+#define FLASH_SECTOR (0x1000)
+#define T_FLASH_PROGRAM EVENT_US(20)
+#define T_FLASH_SECTOR  EVENT_MS(25)
+#define T_FLASH_CHIP    EVENT_MS(100)
+
+static uint8_t *flash_byte(struct cocosdc *d, unsigned a) {
+	struct rombank *rb = d->cart.ROM;
+	unsigned slot = a / SDC_BANK_SIZE;
+	if (!rb->d[slot]) {
+		// An empty bank is erased flash
+		rb->d[slot] = xmalloc(SDC_BANK_SIZE);
+		memset(rb->d[slot], 0xff, SDC_BANK_SIZE);
+	}
+	return (uint8_t *)rb->d[slot] + (a % SDC_BANK_SIZE);
+}
+
+static void flash_erase(struct cocosdc *d, unsigned a, unsigned size) {
+	for (unsigned i = 0; i < size; i++)
+		*flash_byte(d, a + i) = 0xff;
+}
+
+static void flash_busy(struct cocosdc *d, event_ticks t, uint8_t status) {
+	d->flash_busy = 1;
+	d->flash_busy_until = event_current_tick + t;
+	d->flash_status = status;
+	d->flash_modified = 1;
+}
+
+static bool flash_is_busy(struct cocosdc *d) {
+	if (d->flash_busy && event_tick_delta(d->flash_busy_until, event_current_tick) <= 0)
+		d->flash_busy = 0;
+	return d->flash_busy;
+}
+
+// A write cycle to the flash chip.  Command addresses only decode the low
+// 15 bits.
+
+static void flash_write(struct cocosdc *d, unsigned a, uint8_t D) {
+	unsigned ca = a & 0x7fff;
+	if (flash_is_busy(d))
+		return;
+	if (D == 0xf0 && d->flash_state != 3) {
+		// Reset, also leaving software ID mode
+		d->flash_state = 0;
+		d->flash_id = 0;
+		return;
+	}
+	switch (d->flash_state) {
+	case 0: case 4:
+		d->flash_state = (ca == 0x5555 && D == 0xaa) ? d->flash_state + 1 : 0;
+		break;
+	case 1: case 5:
+		d->flash_state = (ca == 0x2aaa && D == 0x55) ? d->flash_state + 1 : 0;
+		break;
+	case 2:
+		d->flash_state = 0;
+		if (ca != 0x5555)
+			break;
+		if (D == 0xa0)
+			d->flash_state = 3;
+		else if (D == 0x80)
+			d->flash_state = 4;
+		else if (D == 0x90)
+			d->flash_id = 1;
+		break;
+	case 3: {
+		// Program a byte: only clears bits
+		uint8_t *p = flash_byte(d, a);
+		*p &= D;
+		flash_busy(d, T_FLASH_PROGRAM, ~D & 0x80);
+		d->flash_state = 0;
+		break;
+	}
+	case 6:
+		d->flash_state = 0;
+		if (D == 0x30) {
+			flash_erase(d, a & ~(FLASH_SECTOR - 1), FLASH_SECTOR);
+			flash_busy(d, T_FLASH_SECTOR, 0);
+		} else if (D == 0x10 && ca == 0x5555) {
+			flash_erase(d, 0, FLASH_SIZE);
+			flash_busy(d, T_FLASH_CHIP, 0);
+		}
+		break;
+	default:
+		d->flash_state = 0;
+		break;
+	}
+}
+
+// A read of the ROM area.  With programming enabled, the first read after
+// writing $FF42 is a write cycle instead.
+
+static uint8_t flash_read(struct cocosdc *d, unsigned a, uint8_t D) {
+	if (d->flash_armed) {
+		d->flash_armed = 0;
+		if (d->flash_enable) {
+			flash_write(d, a, d->flash_data);
+			return D;
+		}
+	}
+	if (flash_is_busy(d)) {
+		// Data polling: bit 7 is inverted and bit 6 toggles until the
+		// operation completes
+		d->flash_toggle = !d->flash_toggle;
+		return d->flash_status | (d->flash_toggle ? 0x40 : 0);
+	}
+	if (d->flash_id)
+		return (a & 1) ? 0xb5 : 0xbf;  // SST, SST39SF010A
+	rombank_d8(d->cart.ROM, a, &D);
+	return D;
+}
+
+// Write the flash to its image file, if it has been changed.
+
+static void flash_save(struct cocosdc *d) {
+	if (!d->flash_file || !d->flash_modified || !d->cart.ROM)
+		return;
+	FILE *f = fopen(d->flash_file, "wb");
+	if (!f) {
+		LOG_MOD_WARN("cocosdc", "%s: %s\n", d->flash_file, strerror(errno));
+		return;
+	}
+	for (unsigned a = 0; a < FLASH_SIZE; a += SDC_BANK_SIZE)
+		fwrite(flash_byte(d, a), 1, SDC_BANK_SIZE, f);
+	fclose(f);
+	d->flash_modified = 0;
+}
+
 static uint8_t cocosdc_read(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D) {
 	struct cocosdc *d = (struct cocosdc *)c;
 	if (R2) {
 		if ((A & 0x3fff) < 0x3f00)
-			rombank_d8(c->ROM, (d->bank << 14) | (A & 0x3fff), &D);
+			D = flash_read(d, (d->bank << 14) | (A & 0x3fff), D);
 		return D;
 	}
 	if (!P2) {
@@ -483,11 +661,11 @@ static uint8_t cocosdc_write(struct cart *c, uint16_t A, bool P2, bool R2, uint8
 		break;
 	case 0x2:
 		d->flash_data = D;
+		d->flash_armed = 1;
 		break;
 	case 0x3:
-		// bit 7 enables flash programming, which isn't emulated
-		if (!(D & 0x80))
-			d->bank = D & 7;
+		d->bank = D & 7;
+		d->flash_enable = D & 0x80;
 		break;
 	default:
 		break;
