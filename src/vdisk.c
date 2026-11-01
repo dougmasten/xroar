@@ -854,6 +854,8 @@ static int vdisk_save_dmk(struct vdisk *disk) {
  * - [4]          Number of cylinders
  * - [5]          Number of sides
  * - [6]          Write protect ($00 = write enable, otherwise write protect)
+ * - [7]          Nested sectors: $01 if one sector's ID field lies within
+ *                another's data field, otherwise $00
  *
  * The rest of the header is zero.  Each track record is a 256-byte sector
  * table, then 6400 bytes of double density track data without clocking.  The
@@ -907,6 +909,10 @@ static struct vdisk *vdisk_load_sdf(const char *filename) {
 	disk->filetype = FILETYPE_SDF;
 	disk->filename = xstrdup(filename);
 	disk->write_protect = header[6] ? 1 : 0;
+	// The CoCo SDC uses this when writing a sector, to drop IDs nested in
+	// its data field.  XRoar always drops overwritten IDs; it's only kept
+	// for rewriting.
+	disk->fmt.sdf.nested_sectors = header[7] ? 1 : 0;
 
 	uint8_t rec[SDF_TRACK_SIZE];
 	for (unsigned cyl = 0; cyl < ncyls; cyl++) {
@@ -958,6 +964,7 @@ static int vdisk_save_sdf(struct vdisk *disk) {
 	header[4] = disk->num_cylinders;
 	header[5] = disk->num_heads;
 	header[6] = disk->write_protect ? 0xff : 0;
+	header[7] = disk->fmt.sdf.nested_sectors ? 1 : 0;
 	fwrite(header, sizeof(header), 1, fd);
 
 	const int adj = SDF_TABLE_SIZE - 128;

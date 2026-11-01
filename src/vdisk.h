@@ -65,8 +65,9 @@ struct vdisk {
 	unsigned num_heads;
 	unsigned track_length;
 	uint8_t **side_data;
-	/* format specific data, kept only for use when rewriting: */
-	union {
+	/* format specific data, kept only for use when rewriting (not a union,
+	 * as a disk may be rewritten in another format): */
+	struct {
 		struct {
 			int extra_length;
 			int filename_length;
@@ -75,6 +76,9 @@ struct vdisk {
 		struct {
 			bool headerless_os9;
 		} jvc;
+		struct {
+			bool nested_sectors;
+		} sdf;
 	} fmt;
 };
 
