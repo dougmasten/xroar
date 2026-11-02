@@ -1236,13 +1236,17 @@ static void mc6809_run(struct MC6809 *cpu) {
 
 			// 0x8f STX immediate, illegal
 			// 0xcf STU immediate, illegal
-			// 0x10xx, 0x11xx - page 2/3 fallthrough, illegal
+			// 0x108f STY immediate, 0x10cf STS immediate, illegal
+			// 0x11xx - page 3 fallthrough, illegal
 			// Illegal instruction only part working
 			case 0x8f: case 0xcf:
 			case 0x028f: case 0x02cf:
 			case 0x038f: case 0x03cf: {
 				unsigned tmp1;
-				tmp1 = !(op & 0x40) ? REG_X : REG_U;
+				if ((op & 0xff00) == 0x0200)
+					tmp1 = !(op & 0x40) ? REG_Y : REG_S;  // [hoglet67]
+				else
+					tmp1 = !(op & 0x40) ? REG_X : REG_U;
 				(void)fetch_byte_notrace(cpu, REG_PC);
 				REG_PC++;
 				store_byte(cpu, REG_PC, tmp1);
