@@ -1648,9 +1648,10 @@ static void hd6309_run(struct MC6809 *cpu) {
 					// STBT
 					mem_byte = (mem_byte & ~dst_mask) | (out << dst_bit);
 					store_byte(cpu, ea, mem_byte);
+					CLR_NZ;  // [hoglet67]
+					SET_NZ8(mem_byte);
 				} else {
 					switch (reg_code) {
-					default:
 					case 0:
 						REG_CC = (REG_CC & ~dst_mask) | (out << dst_bit);
 						break;
@@ -1659,6 +1660,8 @@ static void hd6309_run(struct MC6809 *cpu) {
 						break;
 					case 2:
 						REG_B = (REG_B & ~dst_mask) | (out << dst_bit);
+						break;
+					default: // register field 3 is a NOP [hoglet67]
 						break;
 					}
 				}
