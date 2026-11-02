@@ -1803,8 +1803,7 @@ static void hd6309_run(struct MC6809 *cpu) {
 				default: break;
 				}
 				switch (op & 0xf) {
-				case 0xd: // TST
-					NVMA_CYCLE;
+				case 0xd: // TST: 3 cycles, 2 in native mode, like the others
 					if (!NATIVE_MODE)
 						NVMA_CYCLE;
 					break;
