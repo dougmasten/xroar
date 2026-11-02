@@ -1419,6 +1419,7 @@ static void hd6309_run(struct MC6809 *cpu) {
 					case 0xf: tmp2 = REG_F; break;
 					default: tmp2 = 0; break;
 					}
+					unsigned h = REG_CC & CC_H;
 					switch (op & 0xf) {
 					case 0x0: tmp1 = op_add(cpu, tmp1, tmp2); break;
 					case 0x1: tmp1 = op_adc(cpu, tmp1, tmp2); break;
@@ -1430,10 +1431,19 @@ static void hd6309_run(struct MC6809 *cpu) {
 					case 0x7: (void)op_sub(cpu, tmp1, tmp2); break;
 					default: break;
 					}
+					// ADDR and ADCR leave H alone [hoglet67]
+					if ((op & 0xe) == 0x0)
+						REG_CC = (REG_CC & ~CC_H) | h;
 					switch (postbyte & 0xf) {
 					case 0x8: REG_A = tmp1; break;
 					case 0x9: REG_B = tmp1; break;
-					case 0xa: REG_CC = tmp1; break;
+					case 0xa:
+						// The result goes into CC, then the op's N, Z, V
+						// and (arithmetic only) C are ORed in. CMPR
+						// stores nothing. (Atkinson p143) [hoglet67]
+						if ((op & 0xf) != 0x7)
+							REG_CC = tmp1 | (REG_CC & ((op & 0x4) ? (CC_N|CC_Z|CC_V) : (CC_N|CC_Z|CC_V|CC_C)));
+						break;
 					case 0xb: REG_DP = tmp1; break;
 					case 0xe: REG_E = tmp1; break;
 					case 0xf: REG_F = tmp1; break;
