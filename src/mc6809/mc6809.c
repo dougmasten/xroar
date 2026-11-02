@@ -1434,11 +1434,12 @@ static uint16_t ea_indexed(struct MC6809 *cpu) {
 		case 0x06: ea = reg + sex8(REG_A); peek_byte(cpu, REG_PC); NVMA_CYCLE; break;
 		case 0x08: ea = byte_immediate(cpu); ea = sex8(ea) + reg; NVMA_CYCLE; break;
 		case 0x09: ea = word_immediate(cpu); ea = ea + reg; NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; break;
-		case 0x0a: ea = REG_PC | 0xff; peek_byte(cpu, REG_PC); NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; break;  // TODO: see [dfffffff]
+		// illegal: A is ANDed with the byte after the postbyte [dfffffff] [hoglet67]
+		case 0x0a: ea = (REG_PC + 1) | 0xff; REG_A &= fetch_byte_notrace(cpu, REG_PC); NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; break;
 		case 0x0b: ea = reg + REG_D; peek_byte(cpu, REG_PC); peek_byte(cpu, REG_PC + 1); NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; break;
 		case 0x0c: ea = byte_immediate(cpu); ea = sex8(ea) + REG_PC; NVMA_CYCLE; break;
 		case 0x0d: ea = word_immediate(cpu); ea = ea + REG_PC; peek_byte(cpu, REG_PC); NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; break;
-		case 0x0e: peek_byte(cpu, REG_PC); ea = 0xffff; NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; break; // illegal
+		case 0x0e: peek_byte(cpu, REG_PC); ea = 0xffff; NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; NVMA_CYCLE; break; // illegal [hoglet67]
 		case 0x0f: ea = word_immediate(cpu); NVMA_CYCLE; break;
 	}
 	if (postbyte & 0x10) {
