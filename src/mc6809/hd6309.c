@@ -607,11 +607,13 @@ static void hd6309_run(struct MC6809 *cpu) {
 			case 0x0b: case 0x6b: case 0x7b: {
 				unsigned a, tmp1;
 				REG_M = byte_immediate(cpu);  // [hoglet67]
+				// Direct and extended have no dead cycle before the read,
+				// unlike ea_direct() and ea_extended() [hoglet67]
 				switch ((op >> 4) & 0xf) {
 				default:
-				case 0x0: a = ea_direct(cpu); tmp1 = fetch_byte_notrace(cpu, a); break;
+				case 0x0: a = (REG_DP << 8) | byte_immediate(cpu); tmp1 = fetch_byte_notrace(cpu, a); break;
 				case 0x6: a = ea_indexed(cpu); tmp1 = fetch_byte_notrace(cpu, a); break;
-				case 0x7: a = ea_extended(cpu); tmp1 = fetch_byte_notrace(cpu, a); break;
+				case 0x7: a = word_immediate(cpu); tmp1 = fetch_byte_notrace(cpu, a); break;
 				}
 				switch (op & 0xf) {
 				default:
@@ -620,11 +622,13 @@ static void hd6309_run(struct MC6809 *cpu) {
 				case 0x5: tmp1 = op_eor(cpu, tmp1, REG_M); break;
 				case 0xb: tmp1 = op_and(cpu, tmp1, REG_M); break;
 				}
+				// TIM ends with the read. The others have a dead cycle
+				// before the write [hoglet67]
 				switch (op & 0xf) {
 				case 0xb: // TIM
-					NVMA_CYCLE;
 					break;
 				default: // the others
+					NVMA_CYCLE;
 					store_byte(cpu, a, tmp1);
 					break;
 				}
