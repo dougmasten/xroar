@@ -991,10 +991,10 @@ static void hd6309_run(struct MC6809 *cpu) {
 
 			// 0x39 RTS inherent
 			case 0x39:
-				if (!NATIVE_MODE)
-					peek_byte(cpu, REG_PC);
+				peek_byte(cpu, REG_PC);
 				REG_PC = pull_s_word(cpu);
-				NVMA_CYCLE;
+				if (!NATIVE_MODE)
+					NVMA_CYCLE;
 				break;
 
 			// 0x3a ABX inherent
