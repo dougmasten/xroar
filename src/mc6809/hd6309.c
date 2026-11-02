@@ -2022,9 +2022,12 @@ static void hd6309_run(struct MC6809 *cpu) {
 				int16_t stmp1 = *((int16_t *)&tmp1);
 				int16_t stmp2 = *((int16_t *)&tmp2);
 				int32_t result = stmp1 * stmp2;
-				REG_M = (result < 0) ? 0xff : 0x00;  // [hoglet67]
+				// A cycle more for each negative operand, and one more
+				// when the signs differ, which also sets M [hoglet67]
+				unsigned neg = (tmp1 >> 15) + (tmp2 >> 15) + ((tmp1 ^ tmp2) >> 15);
+				REG_M = ((tmp1 ^ tmp2) & 0x8000) ? 0xff : 0x00;
 				uint32_t uresult = *((uint32_t *)&result);
-				for (int i = 24; i; i--)
+				for (int i = 24 + neg; i; i--)
 					NVMA_CYCLE;
 				REG_D = uresult >> 16;
 				REG_W = uresult & 0xffff;
