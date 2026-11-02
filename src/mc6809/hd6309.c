@@ -1596,9 +1596,9 @@ static void hd6309_run(struct MC6809 *cpu) {
 				}
 				REG_D = fetch_word_notrace(cpu, ea);
 				REG_W = fetch_word_notrace(cpu, ea+2);
-				CLR_NZV;
+				CLR_NZ;  // V not cleared, Z from D only [hoglet67]
 				SET_N16(REG_D);
-				if (REG_D == 0 && REG_W == 0)
+				if (REG_D == 0)
 					REG_CC |= CC_Z;
 			} break;
 
@@ -1615,9 +1615,9 @@ static void hd6309_run(struct MC6809 *cpu) {
 				store_byte(cpu, ea + 1, REG_D);
 				store_byte(cpu, ea + 2, REG_W >> 8);
 				store_byte(cpu, ea + 3, REG_W);
-				CLR_NZV;
+				CLR_NZ;  // V not cleared, Z from D only [hoglet67]
 				SET_N16(REG_D);
-				if (REG_D == 0 && REG_W == 0)
+				if (REG_D == 0)
 					REG_CC |= CC_Z;
 			} break;
 
