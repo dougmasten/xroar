@@ -493,8 +493,11 @@ static void hd6309_run(struct MC6809 *cpu) {
 				hcpu->state = hd6309_state_label_b;
 			} else {
 				NVMA_CYCLE;
-				store_byte(cpu, *hcpu->tfm_dest, REG_M);
+				// The source moves before the write, so with the same
+				// register for both, it writes to the next address
+				// [hoglet67]
 				*hcpu->tfm_src += hcpu->tfm_src_mod;
+				store_byte(cpu, *hcpu->tfm_dest, REG_M);
 				*hcpu->tfm_dest += hcpu->tfm_dest_mod;
 				REG_W--;
 				cpu->nmi_active = cpu->nmi_latch;
