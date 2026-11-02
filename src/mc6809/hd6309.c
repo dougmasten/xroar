@@ -1186,7 +1186,7 @@ static void hd6309_run(struct MC6809 *cpu) {
 				switch ((op >> 4) & 3) {
 				case 0: ea = short_relative(cpu); ea += REG_PC; NVMA_CYCLE; NVMA_CYCLE; if (!NATIVE_MODE) NVMA_CYCLE; break;
 				case 1: ea = ea_direct(cpu); peek_byte(cpu, ea); NVMA_CYCLE; break;
-				case 2: ea = ea_indexed(cpu); peek_byte(cpu, ea); NVMA_CYCLE; break;
+				case 2: ea = ea_indexed(cpu); peek_byte(cpu, ea); if (!NATIVE_MODE) NVMA_CYCLE; break;
 				case 3: ea = ea_extended(cpu); peek_byte(cpu, ea); NVMA_CYCLE; break;
 				default: ea = 0; break;
 				}
