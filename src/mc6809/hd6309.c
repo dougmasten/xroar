@@ -146,6 +146,32 @@ static void instruction_posthook(struct MC6809 *cpu);
 #define NATIVE_MODE (REG_MD & MD_NM)
 #define FIRQ_STACK_ALL (REG_MD & MD_FM)
 
+// DAA. When C is set and A is $80-$99, the 6309 adds a different correction
+// from the 6809's op_daa(). This is from an exhaustive test on a real 6309,
+// which found no pattern [hoglet67]. The flags are set the same way.
+static uint8_t op_daa_6309(struct MC6809 *cpu, uint8_t in) {
+	unsigned add = 0;
+	if ((in & 0x0f) >= 0x0a || REG_CC & CC_H) add |= 0x06;
+	if (in >= 0x90 && (in & 0x0f) >= 0x0a) add |= 0x60;
+	if (in >= 0xa0 || REG_CC & CC_C) add |= 0x60;
+	if ((REG_CC & CC_C) && in >= 0x80 && in <= 0x99) {
+		if (in == 0x99)
+			add = (REG_CC & CC_H) ? 0x67 : 0x68;
+		else if (in == 0x98)
+			add = 0x68;
+		else if (in >= 0x90)
+			add += 0x10;
+		else
+			add += 0x20;
+	}
+	unsigned out = in + add;
+	// CC.C NOT cleared, only set if appropriate
+	CLR_NZV;
+	SET_NZC8(out);
+	REG_CC |= ((out >> 6) ^ ((REG_CC << 1))) & CC_V;
+	return out;
+}
+
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 static uint16_t *tfm_reg_to_ptr(struct HD6309 *hcpu, unsigned reg) {
@@ -690,9 +716,7 @@ static void hd6309_run(struct MC6809 *cpu) {
 
 			// 0x19 DAA inherent
 			case 0x19:
-				// TODO: behaviour for illegal input differs on
-				// the 6309 [hoglet67]
-				REG_A = op_daa(cpu, REG_A);
+				REG_A = op_daa_6309(cpu, REG_A);
 				if (!NATIVE_MODE)
 					peek_byte(cpu, REG_PC);
 				break;
