@@ -35,6 +35,7 @@
 
 #include "top-config.h"
 
+#include <setjmp.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,6 +97,10 @@ static void hd6309_run(struct MC6809 *cpu);
 static uint16_t ea_direct(struct MC6809 *cpu);
 static uint16_t ea_extended(struct MC6809 *cpu);
 static uint16_t ea_indexed(struct MC6809 *cpu);
+
+// ea_indexed() takes the illegal instruction trap for an undefined postbyte, then jumps back to
+// hd6309_run() through this, so the instruction that called it doesn't carry on.
+static jmp_buf illegal_postbyte_trap;
 
 /*
  * Interrupt handling, hooks
@@ -345,6 +350,11 @@ static void hd6309_reset(struct MC6809 *cpu) {
 
 static void hd6309_run(struct MC6809 *cpu) {
 	struct HD6309 *hcpu = (struct HD6309 *)cpu;
+
+	// Back here after an illegal postbyte trap, as after the "continue"
+	// that ends the other traps
+	if (setjmp(illegal_postbyte_trap) && !cpu->running)
+		return;
 
 	do {
 
@@ -635,10 +645,9 @@ static void hd6309_run(struct MC6809 *cpu) {
 			} break;
 
 			// 0x10 Page 2
-			// 0x1010, 0x1011 Page 2
+			// 0x1010, 0x1011 etc. are illegal: the 6309 doesn't chain
+			// prefixes [hoglet67]
 			case 0x10:
-			case 0x0210:
-			case 0x0211:
 				hcpu->state = hd6309_state_next_instruction;
 				cpu->page = 0x200;
 #ifdef TRACE
@@ -649,10 +658,7 @@ static void hd6309_run(struct MC6809 *cpu) {
 				continue;
 
 			// 0x11 Page 3
-			// 0x1110, 0x1111 Page 3
 			case 0x11:
-			case 0x0310:
-			case 0x0311:
 				hcpu->state = hd6309_state_next_instruction;
 				cpu->page = 0x300;
 #ifdef TRACE
@@ -2086,14 +2092,22 @@ static uint16_t ea_extended(struct MC6809 *cpu) {
 
 // Indexed addressing.
 
-// TODO: some undefined postbytes should trigger illegal instruction trap
-// [hoglet67]
-
 static uint16_t ea_indexed(struct MC6809 *cpu) {
 	struct HD6309 *hcpu = (struct HD6309 *)cpu;
 	unsigned ea;
 	uint16_t reg;
 	unsigned postbyte = byte_immediate(cpu);
+	// Undefined postbytes ([,R+], and [n] with a register) take the
+	// illegal instruction trap, as an illegal opcode does [hoglet67]
+	if ((postbyte & 0x9f) == 0x92 || postbyte == 0xbf || postbyte == 0xdf || postbyte == 0xff) {
+		peek_byte(cpu, REG_PC);
+		peek_byte(cpu, REG_PC);
+		REG_MD |= MD_IL;
+		stack_irq_registers(cpu, 1);
+		instruction_posthook(cpu);
+		take_interrupt(cpu, CC_F|CC_I, HD6309_INT_VEC_ILLEGAL);
+		longjmp(illegal_postbyte_trap, 1);
+	}
 	switch ((postbyte >> 5) & 3) {
 		case 0: reg = REG_X; break;
 		case 1: reg = REG_Y; break;
