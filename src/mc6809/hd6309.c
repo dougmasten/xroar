@@ -1866,6 +1866,8 @@ static void hd6309_run(struct MC6809 *cpu) {
 				uint16_t quotient = tmp1 / tmp2;
 				uint8_t remainder = tmp1 % tmp2;
 
+				// M is set by the signs even on overflow [hoglet67]
+				REG_M = (nsign != vsign) ? 0xff : 0x00;
 				CLR_NZVC;
 				if ((quotient >> 8) != 0) {
 					// Range overflow
@@ -1955,6 +1957,8 @@ static void hd6309_run(struct MC6809 *cpu) {
 				uint32_t quotient = tmp1 / tmp2;
 				uint16_t remainder = tmp1 % tmp2;
 
+				// M is set by the signs even on overflow [hoglet67]
+				REG_M = (nsign != vsign) ? 0xff : 0x00;
 				CLR_NZVC;
 				if ((quotient >> 16) != 0) {
 					// Range overflow
