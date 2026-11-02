@@ -2032,7 +2032,7 @@ static void hd6309_run(struct MC6809 *cpu) {
 				SET_N16(REG_D);
 				// lower 16 bits (REG_W) ignored [hoglet67]
 				if (REG_D == 0)
-					REG_CC |= CC_N;
+					REG_CC |= CC_Z;
 			} break;
 
 			// Illegal instruction
