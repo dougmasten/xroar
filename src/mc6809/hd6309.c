@@ -567,9 +567,17 @@ static void hd6309_run(struct MC6809 *cpu) {
 				}
 				switch (op & 0xf) {
 				case 0xd: // TST
-					NVMA_CYCLE;
-					if (!NATIVE_MODE)
+					switch ((op >> 4) & 0xf) {
+					case 0x4: case 0x5: // TSTA, TSTB: 2 cycles, 1 in native mode
+						if (!NATIVE_MODE)
+							peek_byte(cpu, REG_PC);
+						break;
+					default:
 						NVMA_CYCLE;
+						if (!NATIVE_MODE)
+							NVMA_CYCLE;
+						break;
+					}
 					// XXX does the result end up in M for TST?
 					break;
 				default: // the rest need storing

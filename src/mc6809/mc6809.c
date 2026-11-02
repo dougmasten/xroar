@@ -474,8 +474,15 @@ static void mc6809_run(struct MC6809 *cpu) {
 				}
 				switch (op & 0xf) {
 				case 0xd: // TST
-					NVMA_CYCLE;
-					NVMA_CYCLE;
+					switch ((op >> 4) & 0xf) {
+					case 0x4: case 0x5: // TSTA, TSTB: 2 cycles
+						peek_byte(cpu, REG_PC);
+						break;
+					default:
+						NVMA_CYCLE;
+						NVMA_CYCLE;
+						break;
+					}
 					break;
 				default: // the rest need storing
 					switch ((op >> 4) & 0xf) {
