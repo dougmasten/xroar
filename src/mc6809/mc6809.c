@@ -1543,7 +1543,7 @@ static uint8_t op_xdec(struct MC6809 *cpu, uint8_t in) {
 	CLR_NZVC;
 	SET_NZ8(out);
 	if (out == 0x7f) REG_CC |= CC_V;
-	if (in == 0) REG_CC |= CC_C;
+	if (in != 0) REG_CC |= CC_C;  // [hoglet67]
 	return out;
 }
 
